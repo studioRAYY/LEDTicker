@@ -1,0 +1,121 @@
+name: Build & Release (Windows + macOS)
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]   # z.B. v1.0.0 -> erstellt Release
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            py: '3.11'
+            add_data_sep: ':'        # PyInstaller add-data Trennzeichen
+            artifact_suffix: macOS
+          - os: windows-latest
+            py: '3.11'
+            add_data_sep: ';'
+            artifact_suffix: Windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.py }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # Optional: Versionstempel aus Git-Tag/Commit
+      - name: Write build info
+        shell: bash
+        run: |
+          echo "__BUILD__ = '$(date -u +%Y-%m-%dT%H:%M:%SZ) / $GITHUB_SHA'" > build_info.py
+
+      - name: PyInstaller build (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          pyinstaller ^
+            --name "StudioRayyTicker" ^
+            --windowed ^
+            --onefile ^
+            --noconfirm ^
+            --add-data "presets${{ matrix.add_data_sep }}presets" ^
+            main.py
+        shell: bash
+
+      - name: PyInstaller build (Windows)
+        if: matrix.os == 'windows-latest'
+        run: >
+          pyinstaller
+          --name "StudioRayyTicker"
+          --windowed
+          --onefile
+          --noconfirm
+          --add-data "presets${{ matrix.add_data_sep }}presets"
+          main.py
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          mkdir -p dist_pkg
+          # README & Lizenz/Info mitgeben
+          cp -f README.md dist_pkg/ || true
+          # Executable / .app einsammeln
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # PyInstaller --onefile erzeugt ein CLI-Executable (kein .app).
+            # Falls du lieber .app willst: baue ohne --onefile und zippe den .app-Ordner.
+            cp -f dist/StudioRayyTicker dist_pkg/StudioRayyTicker-macOS
+          else
+            cp -f dist/StudioRayyTicker.exe dist_pkg/StudioRayyTicker-Windows.exe
+          fi
+          # Presets für Referenz beilegen
+          [ -d presets ] && cp -r presets dist_pkg/presets
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StudioRayyTicker-${{ matrix.artifact_suffix }}
+          path: dist_pkg/
+
+  release:
+    name: Create GitHub Release
+    needs: [ build ]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/StudioRayyTicker-Windows/**/*
+            artifacts/StudioRayyTicker-macOS/**/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
