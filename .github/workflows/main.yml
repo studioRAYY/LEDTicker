@@ -3,7 +3,7 @@ name: Build & Release (Windows + macOS)
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*' ]   # z.B. v1.0.0 -> erstellt Release
+    tags: [ 'v*' ]         # Tag push (z. B. v1.0.0) erzeugt Release
   workflow_dispatch:
 
 jobs:
@@ -16,11 +16,11 @@ jobs:
         include:
           - os: macos-latest
             py: '3.11'
-            add_data_sep: ':'        # PyInstaller add-data Trennzeichen
+            add_data_sep: ':'         # PyInstaller add-data Separator auf macOS/Linux
             artifact_suffix: macOS
           - os: windows-latest
             py: '3.11'
-            add_data_sep: ';'
+            add_data_sep: ';'         # PyInstaller add-data Separator unter Windows
             artifact_suffix: Windows
 
     steps:
@@ -44,34 +44,31 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller==6.6
 
-      # Optional: Versionstempel aus Git-Tag/Commit
-      - name: Write build info
+      - name: Build info
         shell: bash
         run: |
           echo "__BUILD__ = '$(date -u +%Y-%m-%dT%H:%M:%SZ) / $GITHUB_SHA'" > build_info.py
 
+      # ---------- macOS (bash, backslashes) ----------
       - name: PyInstaller build (macOS)
         if: matrix.os == 'macos-latest'
-        run: |
-          pyinstaller ^
-            --name "StudioRayyTicker" ^
-            --windowed ^
-            --onefile ^
-            --noconfirm ^
-            --add-data "presets${{ matrix.add_data_sep }}presets" ^
-            main.py
         shell: bash
+        run: |
+          pyinstaller \
+            --name "StudioRayyTicker" \
+            --windowed \
+            --onefile \
+            --noconfirm \
+            --add-data "presets${{ matrix.add_data_sep }}presets" \
+            main.py
 
+      # ---------- Windows (eine Zeile) ----------
       - name: PyInstaller build (Windows)
         if: matrix.os == 'windows-latest'
         run: >
-          pyinstaller
-          --name "StudioRayyTicker"
-          --windowed
-          --onefile
-          --noconfirm
+          pyinstaller --name "StudioRayyTicker" --windowed --onefile --noconfirm
           --add-data "presets${{ matrix.add_data_sep }}presets"
           main.py
 
@@ -79,17 +76,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist_pkg
-          # README & Lizenz/Info mitgeben
           cp -f README.md dist_pkg/ || true
-          # Executable / .app einsammeln
           if [ "${{ runner.os }}" = "macOS" ]; then
-            # PyInstaller --onefile erzeugt ein CLI-Executable (kein .app).
-            # Falls du lieber .app willst: baue ohne --onefile und zippe den .app-Ordner.
             cp -f dist/StudioRayyTicker dist_pkg/StudioRayyTicker-macOS
           else
             cp -f dist/StudioRayyTicker.exe dist_pkg/StudioRayyTicker-Windows.exe
           fi
-          # Presets für Referenz beilegen
           [ -d presets ] && cp -r presets dist_pkg/presets
 
       - name: Upload artifact
