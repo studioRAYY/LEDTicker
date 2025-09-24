@@ -1,16 +1,28 @@
-
 import sys, os, shutil, subprocess, json, datetime
 from math import gcd
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 
-from PySide6.QtCore import Qt, QTimer, QRect, QSize
+from PySide6.QtCore import Qt, QTimer, QRect
 from PySide6.QtGui import QPainter, QImage, QColor, QFont, QFontMetrics, QGuiApplication
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QLabel, QLineEdit, QPushButton, QColorDialog, QSpinBox, QFileDialog,
+    QApplication, QWidget, QLabel, QLineEdit, QPushButton, QColorDialog, QDoubleSpinBox, QFileDialog,
     QVBoxLayout, QHBoxLayout, QMainWindow, QMessageBox, QCheckBox, QFontComboBox, QListWidget, QListWidgetItem,
     QTabWidget, QComboBox, QTableWidget, QTableWidgetItem, QHeaderView
 )
+
+# ------------- Utils (PyInstaller resources & ffmpeg) -------------
+def resource_path(*parts):
+    base = getattr(sys, "_MEIPASS", os.path.abspath("."))
+    return os.path.join(base, *parts)
+
+def resolve_ffmpeg():
+    # Prefer bundled
+    for cand in (resource_path("ffmpeg"), resource_path("ffmpeg.exe")):
+        if os.path.isfile(cand):
+            return cand
+    # Fallback PATH
+    return shutil.which("ffmpeg")
 
 # ----------------------------- Data Models -----------------------------
 @dataclass
@@ -27,7 +39,7 @@ class CFG:
     width: int = 1920
     height: int = 1080
     fps: int = 50
-    pixels_per_frame: int = 4  # loop-safe integer
+    speed_px_per_frame: float = 4.0  # live float speed
 
 # ----------------------------- ROI PRESET -----------------------------
 class PortROI:
@@ -36,23 +48,28 @@ class PortROI:
         self.rects = rects
 
 def build_rois_from_preset(preset) -> List[PortROI]:
+    ports_out: List[PortROI] = []
+    if not preset or not preset.get("ports"):
+        return ports_out
     module_w = preset["module"]["w"]
     module_h = preset["module"]["h"]
-    ports_out = []
     for port in preset["ports"]:
         x = port["x"]
         rects = []
-        for blk in port["blocks"]:
+        for blk in port["blocks"] if port.get("blocks") else []:
             order = blk["order"]
             cnt = blk["count"]
-            ys_bottom_up = [824, 568, 312, 56]
-            ys_top_down  = [0, 256, 512, 768]
+            # FullHD vertical positions for 256px modules
+            ys_bottom_up = [824, 568, 312, 56]   # bottom to top (4*256 high)
+            ys_top_down  = [0, 256, 512, 768]    # top to bottom
             ys = ys_bottom_up if order == "bottom_up" else ys_top_down
             rects += [(x, y, module_w, module_h) for y in ys[:cnt]]
         ports_out.append(PortROI(port["id"], rects))
     return ports_out
 
 def draw_roi_overlay(img: QImage, rois: List[PortROI]) -> QImage:
+    if not rois:
+        return img
     out = img.copy()
     p = QPainter(out)
     colors = [QColor(0,255,0), QColor(0,180,255)]
@@ -66,9 +83,6 @@ def draw_roi_overlay(img: QImage, rois: List[PortROI]) -> QImage:
 
 # ----------------------------- Master Strip -----------------------------
 class MasterStrip:
-    """
-    One-row ticker (height = module_h). Each module i samples a 128x256 tile offset along the strip.
-    """
     def __init__(self, text: str, font_family: str, font_pt: int, text_rgb: Tuple[int,int,int], bg_rgb: Tuple[int,int,int],
                  module_w: int, module_h: int, num_modules: int):
         self.text = text if text else " "
@@ -99,11 +113,11 @@ class MasterStrip:
         p2.drawImage(self.text_w,0,self.single)
         p2.end()
 
-    def period_frames(self, ppf: int) -> int:
-        return self.text_w // gcd(self.text_w, ppf)
+    def period_frames(self, int_speed_px_per_frame: int) -> int:
+        return self.text_w // gcd(self.text_w, max(1, int_speed_px_per_frame))
 
-    def tile_src_rect(self, offset_px: int, module_index: int) -> QRect:
-        x = (offset_px + module_index * self.module_w) % self.text_w
+    def tile_src_rect(self, offset_px: float, module_index: int) -> QRect:
+        x = int((offset_px + module_index * self.module_w)) % self.text_w
         return QRect(x, 0, self.module_w, self.module_h)
 
 # ----------------------------- Scheduler -----------------------------
@@ -113,15 +127,9 @@ def parse_time(s: str) -> datetime.time:
 def in_range(t: datetime.time, start: datetime.time, end: datetime.time) -> bool:
     if start <= end:
         return start <= t <= end
-    return t >= start or t <= end
+    return t >= start or t <= end  # overnight window
 
 class Scheduler:
-    """
-    GUI-driven scheduler.
-    Types:
-      - daily: weekdays [0..6], start, end, content, transition, fade_ms
-      - date: date 'YYYY-MM-DD', start, end, content, transition, fade_ms
-    """
     def __init__(self, contents: Dict[str, ContentItem], entries: List[dict] = None):
         self.contents = contents
         self.entries = entries or []
@@ -135,7 +143,7 @@ class Scheduler:
             if e.get("type") == "date" and e.get("date") == now.date().isoformat():
                 if in_range(t, parse_time(e["start"]), parse_time(e["end"])):
                     return e.get("content")
-        # daily
+        # daily next
         for e in self.entries:
             if e.get("type") == "daily" and wd in (e.get("weekdays") or []):
                 if in_range(t, parse_time(e["start"]), parse_time(e["end"])):
@@ -173,25 +181,50 @@ class Main(QMainWindow):
         super().__init__()
         self.setWindowTitle("Studio Rayy — Multi-Content Ticker (Master-Strip)")
         self.cfg = CFG()
+        self.offset = 0.0
 
-        # Load preset
-        preset_path = os.path.join("presets","fhd50_two_ports_128x256_zigzag_multicontent.json")
-        self.preset = json.load(open(preset_path,"r"))
+        # Try load preset from bundle; fallback to EMPTY preset
+        preset_file = resource_path("presets","fhd50_two_ports_128x256_zigzag_multicontent.json")
+        if os.path.exists(preset_file):
+            self.preset = json.load(open(preset_file,"r"))
+        else:
+            # EMPTY preset fallback
+            self.preset = {
+                "name": "EMPTY",
+                "output": {"width":1920,"height":1080,"fps":50},
+                "module": {"w":128,"h":256},
+                "ports": [],
+                "concat_port_order": [],
+                "contents": [{
+                    "name":"Default","text":"",
+                    "font_family":"Arial","font_pt":72,
+                    "text_rgb":[255,255,255],"bg_rgb":[0,0,0]
+                }],
+                "scheduler": {"entries":[]}
+            }
+
         self.module_w = self.preset["module"]["w"]
         self.module_h = self.preset["module"]["h"]
-        self.concat_order = self.preset.get("concat_port_order", ["port1","port2"])
+        self.concat_order = self.preset.get("concat_port_order", [])
         self.rois_ports = build_rois_from_preset(self.preset)
+
+        # Dest sequence in concatenation order (defaults to ports order if concat empty)
         port_map = {p.port_id: p for p in self.rois_ports}
-        self.dest_sequence = []
-        for pid in self.concat_order:
-            self.dest_sequence += port_map[pid].rects
+        if self.concat_order:
+            self.dest_sequence = []
+            for pid in self.concat_order:
+                if pid in port_map:
+                    self.dest_sequence += port_map[pid].rects
+        else:
+            # fall back to simple port order
+            self.dest_sequence = [r for pr in self.rois_ports for r in pr.rects]
         self.num_modules = len(self.dest_sequence)
 
         # Contents
         self.contents: Dict[str, ContentItem] = {}
         for c in self.preset.get("contents", []):
-            item = ContentItem(c["name"], c["text"], c["font_family"], c["font_pt"],
-                               tuple(c["text_rgb"]), tuple(c["bg_rgb"]))
+            item = ContentItem(c["name"], c["text"], c["font_family"], int(c["font_pt"]),
+                               tuple(c["text_rgb"]), tuple(c["bg_rgb"] ))
             self.contents[item.name] = item
 
         # Scheduler
@@ -200,18 +233,31 @@ class Main(QMainWindow):
         self.next_content_name: Optional[str] = None
         self.crossfade_active = False
         self.crossfade_start: Optional[datetime.datetime] = None
-        self.fade_ms_default = 800
+        self.crossfade_ms = 800
 
         # Strips
-        self.strip_curr = self.make_strip(self.current_content_name)
+        self.strip_curr = self.make_strip(self.current_content_name) if self.current_content_name else None
         self.strip_next: Optional[MasterStrip] = None
-
-        self.offset = 0
 
         # Tabs
         tabs = QTabWidget()
 
-        # ---- Tab: Contents ----
+        # ---- Output Tab ----
+        out_tab = QWidget(); v3 = QVBoxLayout(out_tab)
+        ctl = QHBoxLayout()
+        self.speed = QDoubleSpinBox(); self.speed.setRange(0.1, 200.0); self.speed.setDecimals(1); self.speed.setSingleStep(0.1); self.speed.setValue(self.cfg.speed_px_per_frame)
+        self.overlay_chk = QCheckBox("ROI-Overlay"); self.overlay_chk.setChecked(True)
+        self.live_btn = QPushButton("Live"); self.stop_btn = QPushButton("Stop")
+        self.full_btn = QPushButton("Fullscreen (Toggle)")
+        self.exp_btn = QPushButton("Export MP4")
+        ctl.addWidget(QLabel("Geschwindigkeit (px/Frame)")); ctl.addWidget(self.speed); ctl.addWidget(self.overlay_chk)
+        ctl.addWidget(self.live_btn); ctl.addWidget(self.stop_btn); ctl.addWidget(self.full_btn); ctl.addWidget(self.exp_btn)
+        v3.addLayout(ctl)
+        self.preview = Preview(self.cfg.width, self.cfg.height)
+        v3.addWidget(self.preview, 1)
+        tabs.addTab(out_tab, "Output")
+
+        # ---- Contents Tab ----
         contents_tab = QWidget(); v1 = QVBoxLayout(contents_tab)
         self.contents_list = QListWidget()
         for name in self.contents.keys():
@@ -224,7 +270,7 @@ class Main(QMainWindow):
         left.addWidget(QLabel("Name")); self.c_name = QLineEdit(); left.addWidget(self.c_name)
         left.addWidget(QLabel("Text")); self.c_text = QLineEdit(); left.addWidget(self.c_text)
         left.addWidget(QLabel("Font")); self.c_font = QFontComboBox(); left.addWidget(self.c_font)
-        left.addWidget(QLabel("Size")); self.c_size = QSpinBox(); self.c_size.setRange(8,256); self.c_size.setValue(72); left.addWidget(self.c_size)
+        left.addWidget(QLabel("Size")); self.c_size = QDoubleSpinBox(); self.c_size.setRange(8,256); self.c_size.setDecimals(0); self.c_size.setSingleStep(1.0); self.c_size.setValue(72); left.addWidget(self.c_size)
         colorrow = QHBoxLayout()
         self.c_text_color = QPushButton("Textfarbe"); self.c_bg_color = QPushButton("Hintergrund")
         self.c_text_color.clicked.connect(lambda: self.pick_content_color(True))
@@ -236,42 +282,24 @@ class Main(QMainWindow):
         right = QVBoxLayout()
         self.btn_add = QPushButton("Neu"); self.btn_dup = QPushButton("Duplizieren"); self.btn_del = QPushButton("Löschen")
         right.addWidget(self.btn_add); right.addWidget(self.btn_dup); right.addWidget(self.btn_del)
-        v1.addLayout(form)
-        v1.addLayout(right)
-
+        v1.addLayout(form); v1.addLayout(right)
         tabs.addTab(contents_tab, "Contents")
 
-        # ---- Tab: Scheduler ----
+        # ---- Scheduler Tab ----
         sched_tab = QWidget(); v2 = QVBoxLayout(sched_tab)
-        self.tbl = QTableWidget(0, 8)  # type, weekdays, date, start, end, content, transition, fade_ms
+        self.tbl = QTableWidget(0, 8)
         self.tbl.setHorizontalHeaderLabels(["Type","Weekdays","Date","Start","End","Content","Transition","Fade(ms)"])
         self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         v2.addWidget(QLabel("Scheduler (GUI):"))
         v2.addWidget(self.tbl, 1)
-
-        # buttons
         rowb = QHBoxLayout()
         self.btn_add_row = QPushButton("Add Entry"); self.btn_del_row = QPushButton("Delete Entry")
         self.btn_add_row.clicked.connect(self.add_sched_row); self.btn_del_row.clicked.connect(self.del_sched_row)
         rowb.addWidget(self.btn_add_row); rowb.addWidget(self.btn_del_row)
         v2.addLayout(rowb)
-
         tabs.addTab(sched_tab, "Scheduler")
 
-        # ---- Tab: Output ----
-        out_tab = QWidget(); v3 = QVBoxLayout(out_tab)
-        ctl = QHBoxLayout()
-        self.ppf_sb = QSpinBox(); self.ppf_sb.setRange(1,200); self.ppf_sb.setValue(self.cfg.pixels_per_frame)
-        self.overlay_chk = QCheckBox("ROI-Overlay"); self.overlay_chk.setChecked(True)
-        ctl.addWidget(QLabel("Pixel/Frame")); ctl.addWidget(self.ppf_sb); ctl.addWidget(self.overlay_chk)
-        self.live_btn = QPushButton("Live"); self.stop_btn = QPushButton("Stop"); self.full_btn = QPushButton("Fullscreen Out"); self.exp_btn = QPushButton("Export MP4")
-        ctl.addWidget(self.live_btn); ctl.addWidget(self.stop_btn); ctl.addWidget(self.full_btn); ctl.addWidget(self.exp_btn)
-        v3.addLayout(ctl)
-        self.preview = Preview(self.cfg.width, self.cfg.height)
-        v3.addWidget(self.preview, 1)
-        tabs.addTab(out_tab, "Output")
-
-        # ---- Tab: Preset ----
+        # ---- Preset Tab ----
         preset_tab = QWidget(); v4 = QVBoxLayout(preset_tab)
         self.load_preset_btn = QPushButton("Preset laden"); self.save_preset_btn = QPushButton("Preset speichern")
         v4.addWidget(self.load_preset_btn); v4.addWidget(self.save_preset_btn)
@@ -286,12 +314,11 @@ class Main(QMainWindow):
         self.btn_del.clicked.connect(self.del_content)
         self.live_btn.clicked.connect(self.start_live)
         self.stop_btn.clicked.connect(self.stop_live)
-        self.full_btn.clicked.connect(self.fullscreen_out)
+        self.full_btn.clicked.connect(self.fullscreen_toggle)
         self.exp_btn.clicked.connect(self.export_video)
         self.load_preset_btn.clicked.connect(self.load_preset)
         self.save_preset_btn.clicked.connect(self.save_preset)
 
-        # init UI state
         if self.contents_list.count() > 0:
             self.contents_list.setCurrentRow(0)
         self.load_scheduler_into_table()
@@ -308,7 +335,7 @@ class Main(QMainWindow):
         self.c_name.setText(c.name)
         self.c_text.setText(c.text)
         self.c_font.setCurrentFont(QFont(c.font_family))
-        self.c_size.setValue(c.font_pt)
+        self.c_size.setValue(float(c.font_pt))
 
     def pick_content_color(self, text=True):
         cur_name = self.c_name.text()
@@ -350,7 +377,7 @@ class Main(QMainWindow):
     def make_strip(self, content_name: Optional[str]) -> Optional[MasterStrip]:
         if not content_name or content_name not in self.contents: return None
         c = self.contents[content_name]
-        return MasterStrip(c.text, c.font_family, c.font_pt, c.text_rgb, c.bg_rgb, self.module_w, self.module_h, self.num_modules)
+        return MasterStrip(c.text, c.font_family, int(c.font_pt), c.text_rgb, c.bg_rgb, self.module_w, self.module_h, self.num_modules)
 
     # ----------------- Scheduler Table -----------------
     def load_scheduler_into_table(self):
@@ -362,35 +389,28 @@ class Main(QMainWindow):
         r = self.tbl.rowCount()
         self.tbl.insertRow(r)
 
-        # Type
         type_cb = QComboBox(); type_cb.addItems(["daily","date"])
         if e: type_cb.setCurrentText(e.get("type","daily"))
         self.tbl.setCellWidget(r, 0, type_cb)
 
-        # Weekdays (CSV like 0,1,2 etc.)
         wd_item = QTableWidgetItem(",".join(map(str, e.get("weekdays", []))) if e else "")
         self.tbl.setItem(r, 1, wd_item)
 
-        # Date
         date_item = QTableWidgetItem(e.get("date","") if e else "")
         self.tbl.setItem(r, 2, date_item)
 
-        # Start / End
         start_item = QTableWidgetItem(e.get("start","08:00") if e else "08:00")
         end_item   = QTableWidgetItem(e.get("end","18:00") if e else "18:00")
         self.tbl.setItem(r, 3, start_item); self.tbl.setItem(r, 4, end_item)
 
-        # Content selector
         content_cb = QComboBox(); content_cb.addItems(list(self.contents.keys()) or [""])
         if e and e.get("content") in self.contents: content_cb.setCurrentText(e["content"])
         self.tbl.setCellWidget(r, 5, content_cb)
 
-        # Transition
         trans_cb = QComboBox(); trans_cb.addItems(["crossfade","cut"])
         if e: trans_cb.setCurrentText(e.get("transition","crossfade"))
         self.tbl.setCellWidget(r, 6, trans_cb)
 
-        # Fade ms
         fade_item = QTableWidgetItem(str(e.get("fade_ms", 800)) if e else "800")
         self.tbl.setItem(r, 7, fade_item)
 
@@ -402,8 +422,8 @@ class Main(QMainWindow):
         entries = []
         for r in range(self.tbl.rowCount()):
             typ = self.tbl.cellWidget(r,0).currentText()
-            weekdays_csv = self.tbl.item(r,1).text().strip() if self.tbl.item(r,1) else ""
-            weekdays = [int(x) for x in weekdays_csv.split(",") if x.strip().isdigit()] if weekdays_csv else []
+            wd_text = self.tbl.item(r,1).text().strip() if self.tbl.item(r,1) else ""
+            weekdays = [int(x) for x in wd_text.split(",") if x.strip().isdigit()] if wd_text else []
             date = self.tbl.item(r,2).text().strip() if self.tbl.item(r,2) else ""
             start = self.tbl.item(r,3).text().strip() if self.tbl.item(r,3) else "00:00"
             end   = self.tbl.item(r,4).text().strip() if self.tbl.item(r,4) else "23:59"
@@ -411,17 +431,21 @@ class Main(QMainWindow):
             transition = self.tbl.cellWidget(r,6).currentText()
             fade_ms = int(self.tbl.item(r,7).text().strip()) if self.tbl.item(r,7) and self.tbl.item(r,7).text().strip().isdigit() else 800
             ent = {"type": typ, "start": start, "end": end, "content": content, "transition": transition, "fade_ms": fade_ms}
-            if typ == "daily":
-                ent["weekdays"] = weekdays
-            else:
-                ent["date"] = date
+            if typ == "daily": ent["weekdays"] = weekdays
+            else: ent["date"] = date
             entries.append(ent)
         return entries
 
     # ----------------- Render mapping -----------------
-    def render_mapped_frame(self, strip: MasterStrip, offset_px: int) -> QImage:
+    def render_mapped_frame(self, strip: Optional[MasterStrip], offset_px: float) -> QImage:
         frame = QImage(self.cfg.width, self.cfg.height, QImage.Format_RGB888)
-        frame.fill(QColor(0,0,0))
+        # background: current content bg or black
+        bg = (0,0,0)
+        if self.current_content_name and self.current_content_name in self.contents:
+            bg = self.contents[self.current_content_name].bg_rgb
+        frame.fill(QColor(*bg))
+        if strip is None or not self.dest_sequence:
+            return frame
         p = QPainter(frame)
         for idx, (dx,dy,dw,dh) in enumerate(self.dest_sequence):
             src = strip.tile_src_rect(offset_px, idx)
@@ -433,14 +457,21 @@ class Main(QMainWindow):
     def start_live(self): self.timer.start(int(1000 / self.cfg.fps))
     def stop_live(self): self.timer.stop()
 
-    def fullscreen_out(self):
+    def fullscreen_toggle(self):
         screens = QGuiApplication.screens()
-        if len(screens) < 2:
-            QMessageBox.information(self, "Info", "Kein zweiter Bildschirm erkannt."); return
         if not hasattr(self, "out_win") or self.out_win is None:
             self.out_win = OutputWindow(self.cfg.width, self.cfg.height)
-        g = screens[1].geometry()
-        self.out_win.setGeometry(g); self.out_win.showFullScreen()
+        if self.out_win.isVisible():
+            ret = QMessageBox.question(self, "Fullscreen beenden?", "Fullscreen wirklich ausschalten?",
+                                       QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret == QMessageBox.Yes:
+                self.out_win.hide()
+        else:
+            if len(screens) < 2:
+                QMessageBox.information(self, "Info", "Kein zweiter Bildschirm erkannt.")
+                return
+            g = screens[1].geometry()
+            self.out_win.setGeometry(g); self.out_win.showFullScreen()
 
     def composite_crossfade(self, a: QImage, b: QImage, alpha: float) -> QImage:
         out = QImage(a.size(), QImage.Format_RGB888)
@@ -454,8 +485,6 @@ class Main(QMainWindow):
 
     def choose_target_content(self) -> Tuple[Optional[str], Optional[dict]]:
         now = datetime.datetime.now()
-        # find matching entry and return (content_name, entry)
-        # order: date over daily
         for e in self.scheduler.entries:
             if e.get("type") == "date" and e.get("date") == now.date().isoformat():
                 if in_range(now.time(), parse_time(e["start"]), parse_time(e["end"])):
@@ -467,13 +496,12 @@ class Main(QMainWindow):
         return None, None
 
     def tick(self):
-        # schedule
+        # target content
         target_name, entry = self.choose_target_content()
-        fallback = self.preset["contents"][0]["name"] if self.preset.get("contents") else None
+        fallback = next(iter(self.contents.keys()), None)
         desired = target_name or fallback or self.current_content_name
 
         if desired != self.current_content_name and not self.crossfade_active:
-            # transition
             trans = (entry or {}).get("transition","crossfade")
             if trans == "cut":
                 self.current_content_name = desired
@@ -485,9 +513,9 @@ class Main(QMainWindow):
                 self.crossfade_active = True
                 self.crossfade_start = datetime.datetime.now()
 
-        # advance ticker
-        self.cfg.pixels_per_frame = self.ppf_sb.value()
-        self.offset += self.cfg.pixels_per_frame
+        # advance
+        self.cfg.speed_px_per_frame = float(self.speed.value())
+        self.offset += self.cfg.speed_px_per_frame
 
         base_curr = self.render_mapped_frame(self.strip_curr, self.offset)
         frame = base_curr
@@ -511,60 +539,35 @@ class Main(QMainWindow):
 
     # ----------------- Preset IO -----------------
     def load_preset(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Preset laden", "presets", "JSON (*.json)")
+        # allow loading from packaged presets dir by default
+        base_dir = resource_path("presets")
+        path, _ = QFileDialog.getOpenFileName(self, "Preset laden", base_dir, "JSON (*.json)")
         if not path: return
         try:
             p = json.load(open(path,"r"))
-            self.preset = p
-            self.module_w = p["module"]["w"]; self.module_h = p["module"]["h"]
-            self.concat_order = p.get("concat_port_order", ["port1","port2"])
-            self.rois_ports = build_rois_from_preset(p)
-            port_map = {r.port_id: r for r in self.rois_ports}
-            self.dest_sequence = []; 
-            for pid in self.concat_order:
-                self.dest_sequence += port_map[pid].rects
-            self.num_modules = len(self.dest_sequence)
-            # contents
-            self.contents.clear(); self.contents_list.clear()
-            for c in p.get("contents", []):
-                item = ContentItem(c["name"], c["text"], c["font_family"], c["font_pt"],
-                                   tuple(c["text_rgb"]), tuple(c["bg_rgb"]))
-                self.contents[item.name] = item
-                self.contents_list.addItem(item.name)
-            if self.contents_list.count() > 0:
-                self.contents_list.setCurrentRow(0)
-            # scheduler
-            self.scheduler = Scheduler(self.contents, p.get("scheduler", {}).get("entries", []))
-            self.tbl.setRowCount(0); self.load_scheduler_into_table()
+            self.apply_preset(p)
             QMessageBox.information(self, "OK", "Preset geladen.")
         except Exception as e:
             QMessageBox.critical(self, "Fehler", f"Preset konnte nicht geladen werden: {e}")
 
     def save_preset(self):
-        # update current selected content edits back to dict
+        # commit UI changes
         self.commit_current_content_edits()
-        # read scheduler table
         entries = self.read_scheduler_from_table()
-        # build preset
         data = {
             "name": self.preset.get("name","Custom_FHD50_MultiContent"),
             "output": self.preset.get("output", {"width":1920,"height":1080,"fps":50}),
             "module": self.preset.get("module", {"w":128,"h":256}),
             "ports": self.preset.get("ports", []),
-            "concat_port_order": self.preset.get("concat_port_order", ["port1","port2"]),
+            "concat_port_order": self.preset.get("concat_port_order", []),
             "contents": [
-                {
-                    "name": c.name,
-                    "text": c.text,
-                    "font_family": c.font_family,
-                    "font_pt": c.font_pt,
-                    "text_rgb": list(c.text_rgb),
-                    "bg_rgb": list(c.bg_rgb)
-                } for c in self.contents.values()
+                {"name": c.name, "text": c.text, "font_family": c.font_family, "font_pt": int(c.font_pt),
+                 "text_rgb": list(c.text_rgb), "bg_rgb": list(c.bg_rgb)} for c in self.contents.values()
             ],
             "scheduler": {"entries": entries}
         }
-        path, _ = QFileDialog.getSaveFileName(self, "Preset speichern", "presets/custom_multicontent.json", "JSON (*.json)")
+        # save to user-chosen path (not inside _MEIPASS)
+        path, _ = QFileDialog.getSaveFileName(self, "Preset speichern", os.path.expanduser("~/custom_multicontent.json"), "JSON (*.json)")
         if not path: return
         try:
             json.dump(data, open(path,"w"), indent=2)
@@ -572,56 +575,84 @@ class Main(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Fehler", f"Konnte Preset nicht speichern: {e}")
 
+    def apply_preset(self, p: dict):
+        self.preset = p
+        self.module_w = p["module"]["w"]; self.module_h = p["module"]["h"]
+        self.concat_order = p.get("concat_port_order", [])
+        self.rois_ports = build_rois_from_preset(p)
+        port_map = {r.port_id: r for r in self.rois_ports}
+        if self.concat_order:
+            self.dest_sequence = []
+            for pid in self.concat_order:
+                if pid in port_map:
+                    self.dest_sequence += port_map[pid].rects
+        else:
+            self.dest_sequence = [r for pr in self.rois_ports for r in pr.rects]
+        self.num_modules = len(self.dest_sequence)
+        # contents
+        self.contents.clear(); self.contents_list.clear()
+        for c in p.get("contents", []):
+            item = ContentItem(c["name"], c["text"], c["font_family"], int(c["font_pt"]),
+                               tuple(c["text_rgb"]), tuple(c["bg_rgb"]))
+            self.contents[item.name] = item
+            self.contents_list.addItem(item.name)
+        if self.contents_list.count() > 0:
+            self.contents_list.setCurrentRow(0)
+        # scheduler
+        self.scheduler = Scheduler(self.contents, p.get("scheduler", {}).get("entries", []))
+        self.tbl.setRowCount(0); self.load_scheduler_into_table()
+        # reset strips
+        self.current_content_name = self.scheduler.pick_content_name() or (next(iter(self.contents)) if self.contents else None)
+        self.strip_curr = self.make_strip(self.current_content_name)
+
     def commit_current_content_edits(self):
         name = self.c_name.text().strip()
         if not name: return
-        # if renamed, update dict & list
         cur_item = self.contents_list.currentItem()
         if cur_item and name != cur_item.text():
             if name in self.contents:
                 QMessageBox.warning(self, "Hinweis", "Name existiert bereits."); return
-            # rename
             old_name = cur_item.text()
             c = self.contents.pop(old_name)
             c.name = name
             self.contents[name] = c
             cur_item.setText(name)
-
         if name not in self.contents:
             self.contents[name] = ContentItem(name, "", "Arial", 72, (255,255,255), (0,0,0))
-
         c = self.contents[name]
         c.text = self.c_text.text()
         c.font_family = self.c_font.currentFont().family()
-        c.font_pt = self.c_size.value()
+        c.font_pt = int(self.c_size.value())
 
     # ----------------- Export -----------------
     def export_video(self):
-        if shutil.which("ffmpeg") is None:
-            QMessageBox.critical(self, "Fehler", "FFmpeg nicht gefunden. Bitte in PATH aufnehmen."); return
-        if not self.current_content_name:
-            QMessageBox.critical(self, "Fehler", "Kein Content ausgewählt."); return
-        # export loop period based on current strip
-        period = self.strip_curr.period_frames(self.cfg.pixels_per_frame)
+        ffmpeg = resolve_ffmpeg()
+        if not ffmpeg or not os.path.isfile(ffmpeg):
+            QMessageBox.critical(self, "FFmpeg fehlt", "FFmpeg nicht gefunden/bündelt. Bitte Build-Action verwenden oder FFmpeg in PATH aufnehmen.")
+            return
+        if not self.current_content_name or not self.strip_curr:
+            QMessageBox.critical(self, "Fehler", "Kein Content vorhanden."); return
+        int_speed = max(1, int(round(self.cfg.speed_px_per_frame)))
+        period = self.strip_curr.period_frames(int_speed)
         secs = period / self.cfg.fps
-        path, _ = QFileDialog.getSaveFileName(self, "Export", "ticker_fhd50.mp4", "MP4 (*.mp4)")
+        path, _ = QFileDialog.getSaveFileName(self, "Export", os.path.expanduser("~/ticker_fhd50.mp4"), "MP4 (*.mp4)")
         if not path: return
-        cmd = ["ffmpeg","-y",
-               "-f","rawvideo","-pix_fmt","rgb24","-s","1920x1080","-r","50",
+        cmd = [ffmpeg,"-y",
+               "-f","rawvideo","-pix_fmt","rgb24","-s","1920x1080","-r",str(self.cfg.fps),
                "-i","pipe:0",
                "-c:v","libx264","-pix_fmt","yuv420p","-preset","veryfast",
                "-b:v","20M","-maxrate","20M","-bufsize","40M","-movflags","+faststart",
                path]
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-            local = 0
+            local = 0.0
             for _ in range(period):
                 frame = self.render_mapped_frame(self.strip_curr, local)
                 ptr = frame.bits(); ptr.setsize(frame.byteCount())
                 proc.stdin.write(bytes(ptr))
-                local += self.cfg.pixels_per_frame
+                local += int_speed
             proc.stdin.close(); proc.wait()
-            QMessageBox.information(self, "Fertig", f"Export abgeschlossen. Dauer ~{secs:.2f}s, Frames {period}")
+            QMessageBox.information(self, "Fertig", f"Export abgeschlossen. Dauer ~{secs:.2f}s, Frames {period} (Speed {int_speed}px/frame).")
         except Exception as e:
             QMessageBox.critical(self, "Exportfehler", str(e))
 
