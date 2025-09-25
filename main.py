@@ -261,7 +261,7 @@ class MasterStrip:
         return QRect(x, 0, self.module_w, self.module_h)
 
     # Vertikal Sampling (oben->unten). Hier ist die "Lauflänge" text_w entlang der HÖHE.
-        def tile_src_rect_v(self, offset_px: float, module_index: int, reverse=False) -> QRect:
+    def tile_src_rect_v(self, offset_px: float, module_index: int, reverse=False) -> QRect:
         base = (offset_px if not reverse else -offset_px)
         # modulo über die DOPPELTE Höhe (double_v), damit wir sicher im Puffer bleiben
         period = 2 * self.text_w
