@@ -229,22 +229,22 @@ class MasterStrip:
 
         # Vertikal Basetext (um -90° rotieren; Breite=module_w, Höhe=text_w)
         self.single_v = QImage(self.module_w, self.text_w, QImage.Format_RGB888)
+        
         self.single_v.fill(QColor(*self.bg_rgb))
         p3 = QPainter(self.single_v)
         p3.setRenderHint(QPainter.TextAntialiasing, True)
         p3.setPen(QColor(*self.text_rgb))
         p3.setFont(self.font)
-        # Drehen: male horizontalen Text, aber rotiere den Painter um -90° und setze Ursprung so, dass Text mittig landet
-        tr = QTransform()
-        tr.rotate(-90)
-        p3.setTransform(tr)
-        # Nach Rotation liegen Koordinaten anders: zeichne in Fläche (0,-w) -> (h=?, w=?)
-        # Wir platzieren den Text so, dass er die "Höhe" self.text_w entlanggeht
-        # Textbreite horizontal = fm.horizontalAdvance(self.text) = self.text_w
-        # In rotiertem System: x' = 0; y' = module_w/2 + baseline_offset
+        
+        # WICHTIG: erst verschieben, dann drehen – damit der Text IN der Fläche landet
+        p3.translate(0, self.text_w)   # y nach unten schieben (Höhe der vertikalen Fläche)
+        p3.rotate(-90)                  # dann um -90° rotieren
+        
+        # Zentrierter Baseline-Wert quer über die Modulbreite
         baseline_v = (self.module_w + fm.ascent() - fm.descent()) // 2
-        p3.drawText(0, baseline_v, self.text)  # x'==0 => nach Rotation entspricht das oberes Ende
+        p3.drawText(0, baseline_v, self.text)
         p3.end()
+
         self.double_v = QImage(self.module_w, self.text_w*2, QImage.Format_RGB888)
         p4 = QPainter(self.double_v)
         p4.drawImage(0,0,self.single_v)
@@ -262,9 +262,11 @@ class MasterStrip:
 
     # Vertikal Sampling (oben->unten). Hier ist die "Lauflänge" text_w entlang der HÖHE.
     def tile_src_rect_v(self, offset_px: float, module_index: int, reverse=False) -> QRect:
-        base = (offset_px if not reverse else -offset_px)
-        y = int((base + module_index * self.module_h)) % self.text_w
-        return QRect(0, y, self.module_w, self.module_h)
+    base = (offset_px if not reverse else -offset_px)
+    # modulo über die DOPPELTE Höhe (double_v), damit wir sicher im Puffer bleiben
+    period = 2 * self.text_w
+    y = int((base + module_index * self.module_h)) % max(1, period)
+    return QRect(0, y, self.module_w, self.module_h)
 
 # ----------------------------- Scheduler -----------------------------
 def parse_time(s: str) -> datetime.time:
