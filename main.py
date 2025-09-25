@@ -1,11 +1,22 @@
-# main.py — Studio Rayy Ticker (Mapping-Editor, Save-Button, vertikale/horizontale Laufrichtung, Fullscreen-Fix)
-# - GUI: Tabs für Contents, Scheduler, Output, Preset (Load/Save), Mapping (neu)
-# - "Preset aktualisieren": speichert Änderungen in die aktuell geladene Preset-Datei (oder "Speichern unter" falls unbekannt)
-# - Mapping-Editor pro Port: Start-X/Y, Modus (vertical/horizontal), ZigZag, Blockliste (dir/count)
-# - Automatisches Andocken der Blöcke (Zickzack): nach Spalte/Zeile wird passend versetzt (x/y um Modulbreite/-höhe)
-# - Text-Orientierung: vertikale Blöcke scrollen hoch/runter (rotierte Renderquelle), horizontale links/rechts
-# - Fullscreen schließen: Fenster wird wirklich geschlossen (kein schwarzer Screen)
-# - FFmpeg-Export wie gehabt, "Geschwindigkeit" in px/frame (Double)
+# main.py — Studio Rayy Ticker (Mapping-Editor, vertikale/horizontale Laufrichtung,
+# Fullscreen-Fix, Pfadmodus-Umbenennung, Block-Dropdowns, freie Ausgabeauflösung,
+# Export-Zuschnitt/Crop, FFmpeg-Export)
+#
+# Tabs:
+# - Contents: mehrere Texte/Styles definieren (Font, Größe, Farben)
+# - Scheduler: zeitgesteuerter Wechsel (daily/date, Transition, Fade)
+# - Output: Live/Stop/Fullscreen, ROI-Overlay, Geschwindigkeit, Ausgabe-W/H/FPS,
+#           sowie Export MP4 inkl. frei wählbarem Crop (X,Y,W,H)
+# - Preset: laden/speichern/aktualisieren
+# - Mapping: Ports/Module/Blöcke konfigurieren (Mode, Pfadmodus "snake/reset",
+#            Block-Direction per Dropdown)
+#
+# Hinweise:
+# - "Pfadmodus" ersetzt das frühere "ZigZag"-Flag. (Die eigentliche Schlangen-Phasenlogik
+#   kann auf Wunsch zusätzlich eingebaut werden; aktuell bleibt die Phasenführung wie zuvor.)
+# - Vertikale Textdarstellung: Fix durch translate + rotate, damit Text sichtbar ist.
+# - tile_src_rect_v nutzt Modulo über 2*text_w (robusteres Sampling gegen double_v).
+# - Export unterstützt frei einstellbaren Zuschnitt (Crop) und dynamische Ausgabegröße/FPS.
 
 import sys, os, shutil, subprocess, json, datetime
 from math import gcd
@@ -13,7 +24,7 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 
 from PySide6.QtCore import Qt, QTimer, QRect
-from PySide6.QtGui import QPainter, QImage, QColor, QFont, QFontMetrics, QGuiApplication, QTransform
+from PySide6.QtGui import QPainter, QImage, QColor, QFont, QFontMetrics, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QLineEdit, QPushButton, QColorDialog, QDoubleSpinBox, QFileDialog,
     QSpinBox, QVBoxLayout, QHBoxLayout, QMainWindow, QMessageBox, QCheckBox, QFontComboBox, QListWidget, QListWidgetItem,
@@ -63,32 +74,30 @@ def _gen_rects_new_port(port: dict, module_w: int, module_h: int) -> List[Tuple[
     Neues Mapping-Format:
       {
         "id": "port1",
-        "start": {"x": 0, "y": 824},     # Start-TopLeft Bezug (frei wählbar)
-        "mode": "vertical"|"horizontal", # Hauptrichtung der Spalten/Zeilenbildung
-        "zigzag": true|false,            # beim Anfügen nächste Spalte/Zeile mit invertierter Laufrichtung (nur Darstellung/dir)
+        "start": {"x": 0, "y": 824},
+        "mode": "vertical"|"horizontal",
+        "path_mode": "snake"|"reset",   # (ersetzt früheres "zigzag")
         "blocks": [ {"dir":"bottom_up","count":4}, {"dir":"top_down","count":4}, ... ]
       }
-    Regeln:
-     - mode=vertical: jeder Block ist eine Spalte; innerhalb der Spalte werden count Module in y-Richtung gestapelt.
-       Danach springt X um module_w weiter (neue Spalte). Y-Start richtet sich nach 'dir':
-         * bottom_up  -> erster Kachel bei start.y, dann nach oben (y - k*module_h)
-         * top_down   -> erster Kachel bei start.y, dann nach unten (y + k*module_h)
-     - mode=horizontal: analog umgekehrt (Zeilen).
-     - dir steuert auch die Textlaufrichtung pro Kachel (links->rechts, rechts->links, unten->oben, oben->unten).
+    Regeln (Geometrie):
+     - mode=vertical: jeder Block beschreibt eine Spalte; innerhalb davon werden count Module in y-Richtung gestapelt.
+       Danach springt X um module_w weiter (neue Spalte).
+     - mode=horizontal: analog für Zeilen.
+     - dir steuert außerdem die Textlaufrichtung pro Kachel (links->rechts, rechts->links, unten->oben, oben->unten).
     """
     sx = int(port.get("start", {}).get("x", 0))
     sy = int(port.get("start", {}).get("y", 0))
     mode = port.get("mode", "vertical")
-    zigzag = bool(port.get("zigzag", True))
+    # path_mode gelesen, derzeit noch ohne spezielle Phasenlogik verwendet
+    _path_mode = port.get("path_mode", "snake")
     blocks = port.get("blocks", [])
     rects: List[Tuple[int,int,int,int,str]] = []
     cur_x, cur_y = sx, sy
 
-    for bi, blk in enumerate(blocks):
+    for blk in blocks:
         dirv = blk.get("dir", "bottom_up" if mode == "vertical" else "left_right")
         count = int(blk.get("count", 0))
         if count <= 0:
-            # trotzdem Spalte/Zeile vorrücken
             if mode == "vertical":
                 cur_x += module_w
             else:
@@ -96,16 +105,11 @@ def _gen_rects_new_port(port: dict, module_w: int, module_h: int) -> List[Tuple[
             continue
 
         if mode == "vertical":
-            # Spalte
             if dirv == "bottom_up":
-                # erster bei cur_y (unten), dann nach oben
                 for k in range(count):
                     y = cur_y - k*module_h
                     rects.append( (cur_x, y, module_w, module_h, "bottom_up") )
-                # next column:
                 cur_x += module_w
-                # bei ZigZag beginnt nächste Spalte wieder unten (cur_y bleibt als "unten"-Referenz)
-                # nichts zu tun
             elif dirv == "top_down":
                 for k in range(count):
                     y = cur_y + k*module_h
@@ -118,7 +122,7 @@ def _gen_rects_new_port(port: dict, module_w: int, module_h: int) -> List[Tuple[
                     rects.append( (cur_x, y, module_w, module_h, "top_down") )
                 cur_x += module_w
         else:
-            # mode == horizontal -> Zeile
+            # horizontal mode
             if dirv == "left_right":
                 for k in range(count):
                     x = cur_x + k*module_w
@@ -130,7 +134,6 @@ def _gen_rects_new_port(port: dict, module_w: int, module_h: int) -> List[Tuple[
                     rects.append( (x, cur_y, module_w, module_h, "right_left") )
                 cur_y += module_h
             else:
-                # falls vertikale dirs im horizontal mode: nimm left_right
                 for k in range(count):
                     x = cur_x + k*module_w
                     rects.append( (x, cur_y, module_w, module_h, "left_right") )
@@ -139,29 +142,27 @@ def _gen_rects_new_port(port: dict, module_w: int, module_h: int) -> List[Tuple[
     return rects
 
 def build_rois_from_preset(preset) -> List[PortROI]:
-    """Unterstützt altes und neues Mapping-Format."""
+    """Unterstützt neues Mapping-Format; migriert ggf. sehr alte Struktur."""
     module_w = preset.get("module", {}).get("w", 128)
     module_h = preset.get("module", {}).get("h", 256)
     ports = preset.get("ports", [])
     ports_out: List[PortROI] = []
 
     if not ports:
-        # minimaler Fallback (2 Ports à 3 Blöcke)
         ports = [
-            {"id":"port1","start":{"x":0,"y":824},"mode":"vertical","zigzag":True,
+            {"id":"port1","start":{"x":0,"y":824},"mode":"vertical","path_mode":"snake",
              "blocks":[{"dir":"bottom_up","count":4},{"dir":"top_down","count":4},{"dir":"bottom_up","count":4}]},
-            {"id":"port2","start":{"x":128,"y":824},"mode":"vertical","zigzag":True,
+            {"id":"port2","start":{"x":128,"y":824},"mode":"vertical","path_mode":"snake",
              "blocks":[{"dir":"bottom_up","count":4},{"dir":"top_down","count":4},{"dir":"bottom_up","count":4}]}
         ]
         preset["ports"] = ports
         preset["module"] = {"w": module_w, "h": module_h}
 
     for port in ports:
-        # neues Format?
         if "start" in port or "mode" in port:
             rects = _gen_rects_new_port(port, module_w, module_h)
         else:
-            # altes Format migrieren (x + blocks[order/count] nur vertical entlang fester Y-Punkte)
+            # extreme Altlast – einfache Migration mit Spaltenversatz
             x = int(port.get("x", 0))
             rects_tmp = []
             for blk in port.get("blocks", []):
@@ -172,7 +173,7 @@ def build_rois_from_preset(preset) -> List[PortROI]:
                 ys = ys_bottom_up if order == "bottom_up" else ys_top_down
                 for y in ys[:cnt]:
                     rects_tmp.append((x, y, module_w, module_h, "bottom_up" if order=="bottom_up" else "top_down"))
-                x += module_w  # jede Spalte weiter
+                x += module_w
             rects = rects_tmp
         ports_out.append(PortROI(port.get("id","port"), rects))
     return ports_out
@@ -227,24 +228,19 @@ class MasterStrip:
         p2.drawImage(self.text_w,0,self.single_h)
         p2.end()
 
-        # Vertikal Basetext (um -90° rotieren; Breite=module_w, Höhe=text_w)
+        # Vertikal Basetext (sichtbar durch translate + rotate)
         self.single_v = QImage(self.module_w, self.text_w, QImage.Format_RGB888)
-        
         self.single_v.fill(QColor(*self.bg_rgb))
         p3 = QPainter(self.single_v)
         p3.setRenderHint(QPainter.TextAntialiasing, True)
         p3.setPen(QColor(*self.text_rgb))
         p3.setFont(self.font)
-        
-        # WICHTIG: erst verschieben, dann drehen – damit der Text IN der Fläche landet
-        p3.translate(0, self.text_w)   # y nach unten schieben (Höhe der vertikalen Fläche)
-        p3.rotate(-90)                  # dann um -90° rotieren
-        
-        # Zentrierter Baseline-Wert quer über die Modulbreite
+        # Wichtig: Ursprung verschieben und dann drehen, damit Text in der Fläche landet
+        p3.translate(0, self.text_w)
+        p3.rotate(-90)
         baseline_v = (self.module_w + fm.ascent() - fm.descent()) // 2
         p3.drawText(0, baseline_v, self.text)
         p3.end()
-
         self.double_v = QImage(self.module_w, self.text_w*2, QImage.Format_RGB888)
         p4 = QPainter(self.double_v)
         p4.drawImage(0,0,self.single_v)
@@ -260,10 +256,9 @@ class MasterStrip:
         x = int((base + module_index * self.module_w)) % self.text_w
         return QRect(x, 0, self.module_w, self.module_h)
 
-    # Vertikal Sampling (oben->unten). Hier ist die "Lauflänge" text_w entlang der HÖHE.
+    # Vertikal Sampling (oben->unten). Modulo über double-Höhe robuster.
     def tile_src_rect_v(self, offset_px: float, module_index: int, reverse=False) -> QRect:
         base = (offset_px if not reverse else -offset_px)
-        # modulo über die DOPPELTE Höhe (double_v), damit wir sicher im Puffer bleiben
         period = 2 * self.text_w
         y = int((base + module_index * self.module_h)) % max(1, period)
         return QRect(0, y, self.module_w, self.module_h)
@@ -349,8 +344,9 @@ class Main(QMainWindow):
         port_map = {p.port_id: p for p in self.rois_ports}
         self.dest_sequence = []
         for pid in self.concat_order:
-            self.dest_sequence += port_map[pid].rects
-        self.num_modules = len(self.dest_sequence)
+            if pid in port_map:
+                self.dest_sequence += port_map[pid].rects
+        self.num_modules = max(1, len(self.dest_sequence))
 
         # Contents
         self.contents: Dict[str, ContentItem] = {}
@@ -363,6 +359,12 @@ class Main(QMainWindow):
             item = ContentItem(c["name"], c["text"], c["font_family"], int(c["font_pt"]),
                                tuple(c["text_rgb"]), tuple(c["bg_rgb"]))
             self.contents[item.name] = item
+
+        # Output (aus Preset übernehmen)
+        out = self.preset.get("output", {})
+        self.cfg.width  = int(out.get("width",  self.cfg.width))
+        self.cfg.height = int(out.get("height", self.cfg.height))
+        self.cfg.fps    = int(out.get("fps",    self.cfg.fps))
 
         # Scheduler
         self.scheduler = Scheduler(self.contents, self.preset.get("scheduler", {}).get("entries", []))
@@ -449,7 +451,19 @@ class Main(QMainWindow):
         # -------- Output Tab --------
         out_tab = QWidget()
         v3 = QVBoxLayout(out_tab)
+
+        # Control Row 1: Ausgabe/Live
         ctl = QHBoxLayout()
+
+        # Ausgabeauflösung + FPS
+        self.out_w = QSpinBox(); self.out_w.setRange(64, 8192); self.out_w.setValue(self.cfg.width)
+        self.out_h = QSpinBox(); self.out_h.setRange(64, 8192); self.out_h.setValue(self.cfg.height)
+        self.fps_box = QSpinBox(); self.fps_box.setRange(1, 240); self.fps_box.setValue(self.cfg.fps)
+        ctl.addWidget(QLabel("W"));  ctl.addWidget(self.out_w)
+        ctl.addWidget(QLabel("H"));  ctl.addWidget(self.out_h)
+        ctl.addWidget(QLabel("FPS")); ctl.addWidget(self.fps_box)
+
+        # Laufgeschwindigkeit & Overlay & Controls
         self.speed = QDoubleSpinBox()
         self.speed.setRange(0.1, 200.0)
         self.speed.setDecimals(1)
@@ -468,7 +482,23 @@ class Main(QMainWindow):
         ctl.addWidget(self.stop_btn)
         ctl.addWidget(self.full_btn)
         ctl.addWidget(self.exp_btn)
+
         v3.addLayout(ctl)
+
+        # Control Row 2: Crop
+        crop_row = QHBoxLayout()
+        self.crop_enable = QCheckBox("Zuschnitt aktiv")
+        self.crop_x = QSpinBox(); self.crop_x.setRange(0, 32768); self.crop_x.setValue(0)
+        self.crop_y = QSpinBox(); self.crop_y.setRange(0, 32768); self.crop_y.setValue(0)
+        self.crop_w = QSpinBox(); self.crop_w.setRange(1, 32768); self.crop_w.setValue(self.cfg.width)
+        self.crop_h = QSpinBox(); self.crop_h.setRange(1, 32768); self.crop_h.setValue(self.cfg.height)
+        crop_row.addWidget(self.crop_enable)
+        crop_row.addWidget(QLabel("X")); crop_row.addWidget(self.crop_x)
+        crop_row.addWidget(QLabel("Y")); crop_row.addWidget(self.crop_y)
+        crop_row.addWidget(QLabel("W")); crop_row.addWidget(self.crop_w)
+        crop_row.addWidget(QLabel("H")); crop_row.addWidget(self.crop_h)
+        v3.addLayout(crop_row)
+
         self.preview = Preview(self.cfg.width, self.cfg.height)
         v3.addWidget(self.preview, 1)
         tabs.addTab(out_tab, "Output")
@@ -484,7 +514,7 @@ class Main(QMainWindow):
         v4.addWidget(self.update_preset_btn)
         tabs.addTab(preset_tab, "Preset")
 
-        # -------- Mapping Tab (NEU) --------
+        # -------- Mapping Tab --------
         map_tab = QWidget()
         v5 = QVBoxLayout(map_tab)
 
@@ -521,8 +551,9 @@ class Main(QMainWindow):
         det.addLayout(colL)
         colM = QVBoxLayout()
         self.p_mode = QComboBox(); self.p_mode.addItems(["vertical","horizontal"])
-        self.p_zigzag = QCheckBox("ZigZag")
-        colM.addWidget(QLabel("Mode")); colM.addWidget(self.p_mode); colM.addWidget(self.p_zigzag)
+        self.p_path_mode = QComboBox(); self.p_path_mode.addItems(["snake","reset"])
+        colM.addWidget(QLabel("Mode")); colM.addWidget(self.p_mode)
+        colM.addWidget(QLabel("Pfadmodus")); colM.addWidget(self.p_path_mode)
         det.addLayout(colM)
 
         # Blocks Tabelle
@@ -549,7 +580,6 @@ class Main(QMainWindow):
         v5.addLayout(actrow)
 
         tabs.addTab(map_tab, "Mapping")
-
         self.setCentralWidget(tabs)
 
         # Connections
@@ -576,6 +606,11 @@ class Main(QMainWindow):
         self.btn_apply_mapping.clicked.connect(self.apply_mapping_runtime)
         self.btn_save_mapping_into_preset.clicked.connect(self.commit_mapping_into_preset)
 
+        # Ausgabe-Änderungen live übernehmen
+        self.out_w.valueChanged.connect(self.on_out_res_changed)
+        self.out_h.valueChanged.connect(self.on_out_res_changed)
+        self.fps_box.valueChanged.connect(self.on_fps_changed)
+
         if self.contents_list.count() > 0:
             self.contents_list.setCurrentRow(0)
         self.load_scheduler_into_table()
@@ -584,7 +619,7 @@ class Main(QMainWindow):
         self.out_win = None
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
-        self.resize(1400, 950)
+        self.resize(1400, 980)
 
     # -------- Initial Preset Load --------
     def load_initial_preset(self) -> dict:
@@ -606,9 +641,9 @@ class Main(QMainWindow):
             "output": {"width": 1920, "height": 1080, "fps": 50},
             "module": {"w": 128, "h": 256},
             "ports": [
-                {"id":"port1","start":{"x":0,"y":824},"mode":"vertical","zigzag":True,
+                {"id":"port1","start":{"x":0,"y":824},"mode":"vertical","path_mode":"snake",
                  "blocks":[{"dir":"bottom_up","count":4},{"dir":"top_down","count":4},{"dir":"bottom_up","count":4}]},
-                {"id":"port2","start":{"x":128,"y":824},"mode":"vertical","zigzag":True,
+                {"id":"port2","start":{"x":128,"y":824},"mode":"vertical","path_mode":"snake",
                  "blocks":[{"dir":"bottom_up","count":4},{"dir":"top_down","count":4},{"dir":"bottom_up","count":4}]}
             ],
             "concat_port_order": ["port1","port2"],
@@ -741,7 +776,7 @@ class Main(QMainWindow):
         else:
             # erster Port wenn leer
             self.preset.setdefault("ports", []).append({
-                "id":"port1", "start":{"x":0,"y":824}, "mode":"vertical", "zigzag":True,
+                "id":"port1", "start":{"x":0,"y":824}, "mode":"vertical", "path_mode":"snake",
                 "blocks":[{"dir":"bottom_up","count":4}]
             })
             self.ports_list.addItem("port1")
@@ -761,21 +796,23 @@ class Main(QMainWindow):
         self.p_start_x.setValue(int(sx))
         self.p_start_y.setValue(int(sy))
         self.p_mode.setCurrentText(p.get("mode","vertical"))
-        self.p_zigzag.setChecked(bool(p.get("zigzag", True)))
+        self.p_path_mode.setCurrentText(p.get("path_mode","snake"))
         # Blocks
         blks = p.get("blocks", [])
         self.blocks_tbl.setRowCount(0)
         for b in blks:
             r = self.blocks_tbl.rowCount()
             self.blocks_tbl.insertRow(r)
-            dir_item = QTableWidgetItem(str(b.get("dir","bottom_up")))
+            dir_cb = QComboBox()
+            dir_cb.addItems(["bottom_up","top_down","left_right","right_left"])
+            dir_cb.setCurrentText(str(b.get("dir","bottom_up")))
+            self.blocks_tbl.setCellWidget(r, 0, dir_cb)
             cnt_item = QTableWidgetItem(str(b.get("count",1)))
-            self.blocks_tbl.setItem(r,0,dir_item)
-            self.blocks_tbl.setItem(r,1,cnt_item)
+            self.blocks_tbl.setItem(r, 1, cnt_item)
 
     def add_port(self):
         base = {"id": f"port{len(self.preset.get('ports',[]))+1}",
-                "start":{"x":0,"y":824},"mode":"vertical","zigzag":True,
+                "start":{"x":0,"y":824},"mode":"vertical","path_mode":"snake",
                 "blocks":[{"dir":"bottom_up","count":4}]}
         self.preset.setdefault("ports", []).append(base)
         self.ports_list.addItem(base["id"])
@@ -792,8 +829,11 @@ class Main(QMainWindow):
     def add_block(self):
         r = self.blocks_tbl.rowCount()
         self.blocks_tbl.insertRow(r)
-        self.blocks_tbl.setItem(r,0, QTableWidgetItem("bottom_up"))
-        self.blocks_tbl.setItem(r,1, QTableWidgetItem("4"))
+        dir_cb = QComboBox()
+        dir_cb.addItems(["bottom_up","top_down","left_right","right_left"])
+        dir_cb.setCurrentIndex(0)
+        self.blocks_tbl.setCellWidget(r, 0, dir_cb)
+        self.blocks_tbl.setItem(r, 1, QTableWidgetItem("4"))
 
     def del_block(self):
         r = self.blocks_tbl.currentRow()
@@ -804,20 +844,14 @@ class Main(QMainWindow):
         # Globale Module
         self.preset.setdefault("module",{})["w"] = int(self.mod_w.value())
         self.preset.setdefault("module",{})["h"] = int(self.mod_h.value())
-        # Ports Details -> Preset schreiben (aktuell ausgewählter Port + IDs sync)
-        ports = self.preset.setdefault("ports", [])
-        # Sync Ids aus ListWidget falls geändert
-        for i in range(self.ports_list.count()):
-            # wenn Port-ID geändert, später anwenden
-            pass
-
+        # Port Details
         p = self.current_port_ref()
         if not p:
             return
         old_id = p.get("id","")
         new_id = self.p_id.text().strip() or old_id
         p["id"] = new_id
-        # Bei Namensänderung auch in concat_port_order ggf. ersetzen
+        # concat_port_order ggf. aktualisieren
         cpo = self.preset.setdefault("concat_port_order", [])
         for i, pid in enumerate(cpo):
             if pid == old_id:
@@ -826,12 +860,14 @@ class Main(QMainWindow):
         p.setdefault("start",{})["x"] = int(self.p_start_x.value())
         p.setdefault("start",{})["y"] = int(self.p_start_y.value())
         p["mode"] = self.p_mode.currentText()
-        p["zigzag"] = bool(self.p_zigzag.isChecked())
+        p["path_mode"] = self.p_path_mode.currentText()  # "snake" | "reset"
 
         blks = []
         for r in range(self.blocks_tbl.rowCount()):
-            dirv = self.blocks_tbl.item(r,0).text().strip() if self.blocks_tbl.item(r,0) else "bottom_up"
-            cnt  = self.blocks_tbl.item(r,1).text().strip() if self.blocks_tbl.item(r,1) else "1"
+            dir_widget = self.blocks_tbl.cellWidget(r, 0)
+            dirv = dir_widget.currentText() if isinstance(dir_widget, QComboBox) else "bottom_up"
+            cnt_item = self.blocks_tbl.item(r, 1)
+            cnt  = cnt_item.text().strip() if cnt_item else "1"
             try:
                 cnti = max(0, int(cnt))
             except:
@@ -854,6 +890,18 @@ class Main(QMainWindow):
         self.apply_preset(self.preset)
         QMessageBox.information(self, "Mapping", "Mapping angewendet.")
 
+    # -------- Ausgabe-Änderungen --------
+    def on_out_res_changed(self):
+        self.cfg.width = int(self.out_w.value())
+        self.cfg.height = int(self.out_h.value())
+        # Preview rendert mit neuer Größe (render_mapped_frame erzeugt images in cfg-size)
+
+    def on_fps_changed(self):
+        self.cfg.fps = int(self.fps_box.value())
+        if self.timer.isActive():
+            self.timer.start(int(1000 / max(1, self.cfg.fps)))
+        self.preset.setdefault("output", {})["fps"] = self.cfg.fps
+
     # -------- Render mapping --------
     def render_mapped_frame(self, strip: MasterStrip, offset_px: float) -> QImage:
         frame = QImage(self.cfg.width, self.cfg.height, QImage.Format_RGB888)
@@ -870,7 +918,6 @@ class Main(QMainWindow):
                 src = strip.tile_src_rect_v(offset_px, idx, reverse=(dirv=="bottom_up"))
                 p.drawImage(QRect(dx,dy,dw,dh), strip.double_v, src)
             else:
-                # Fallback horizontal
                 src = strip.tile_src_rect_h(offset_px, idx, reverse=False)
                 p.drawImage(QRect(dx,dy,dw,dh), strip.double_h, src)
         p.end()
@@ -893,7 +940,6 @@ class Main(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No
             )
             if ret == QMessageBox.Yes:
-                # Fenster wirklich schließen (kein schwarzer Screen)
                 self.out_win.close()
                 self.out_win = None
         else:
@@ -989,7 +1035,11 @@ class Main(QMainWindow):
         self.commit_mapping_from_gui()
         return {
             "name": self.preset.get("name","Custom_FHD50_MultiContent"),
-            "output": self.preset.get("output", {"width":self.cfg.width,"height":self.cfg.height,"fps":self.cfg.fps}),
+            "output": {
+                "width": int(self.out_w.value()),
+                "height": int(self.out_h.value()),
+                "fps": int(self.fps_box.value())
+            },
             "module": {"w": int(self.mod_w.value()), "h": int(self.mod_h.value())},
             "ports": self.preset.get("ports", []),
             "concat_port_order": self.preset.get("concat_port_order", ["port1","port2"]),
@@ -1036,7 +1086,7 @@ class Main(QMainWindow):
         for pid in self.concat_order:
             if pid in port_map:
                 self.dest_sequence += port_map[pid].rects
-        self.num_modules = len(self.dest_sequence)
+        self.num_modules = max(1, len(self.dest_sequence))
 
         # Contents
         self.contents.clear()
@@ -1056,6 +1106,15 @@ class Main(QMainWindow):
         self.load_scheduler_into_table()
 
         self.load_mapping_into_gui()
+
+        # Output übernehmen
+        out = p.get("output", {})
+        self.cfg.width  = int(out.get("width",  self.cfg.width))
+        self.cfg.height = int(out.get("height", self.cfg.height))
+        self.cfg.fps    = int(out.get("fps",    self.cfg.fps))
+        self.out_w.setValue(self.cfg.width)
+        self.out_h.setValue(self.cfg.height)
+        self.fps_box.setValue(self.cfg.fps)
 
         self.current_content_name = self.scheduler.pick_content_name() or p["contents"][0]["name"]
         self.strip_curr = self.make_strip(self.current_content_name)
@@ -1096,25 +1155,59 @@ class Main(QMainWindow):
             return
         int_speed = max(1, int(round(self.cfg.speed_px_per_frame)))
         period = self.strip_curr.period_frames(int_speed)
-        secs = period / self.cfg.fps
-        path, _ = QFileDialog.getSaveFileName(self, "Export", os.path.join(os.path.expanduser("~"), "ticker_fhd50.mp4"), "MP4 (*.mp4)")
+        path, _ = QFileDialog.getSaveFileName(self, "Export", os.path.join(os.path.expanduser("~"), "ticker_export.mp4"), "MP4 (*.mp4)")
         if not path:
             return
-        cmd = [ffmpeg,"-y","-f","rawvideo","-pix_fmt","rgb24","-s","1920x1080","-r",str(self.cfg.fps),
-               "-i","pipe:0","-c:v","libx264","-pix_fmt","yuv420p","-preset","veryfast",
-               "-b:v","20M","-maxrate","20M","-bufsize","40M","-movflags","+faststart", path]
+
+        # Zielgröße: ganze Stage oder Crop
+        full_w, full_h = self.cfg.width, self.cfg.height
+        exp_x = int(self.crop_x.value())
+        exp_y = int(self.crop_y.value())
+        exp_w = int(self.crop_w.value())
+        exp_h = int(self.crop_h.value())
+        if not self.crop_enable.isChecked():
+            exp_x, exp_y, exp_w, exp_h = 0, 0, full_w, full_h
+
+        # Clamp
+        exp_x = max(0, min(exp_x, full_w-1))
+        exp_y = max(0, min(exp_y, full_h-1))
+        exp_w = max(1, min(exp_w, full_w - exp_x))
+        exp_h = max(1, min(exp_h, full_h - exp_y))
+
+        cmd = [
+            ffmpeg, "-y",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-s", f"{exp_w}x{exp_h}",
+            "-r", str(self.cfg.fps),
+            "-i", "pipe:0",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "veryfast",
+            "-b:v", "20M", "-maxrate", "20M", "-bufsize", "40M",
+            "-movflags", "+faststart",
+            path
+        ]
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
             local = 0.0
             for _ in range(period):
-                frame = self.render_mapped_frame(self.strip_curr, local)
-                ptr = frame.bits()
-                ptr.setsize(frame.byteCount())
+                frame = self.render_mapped_frame(self.strip_curr, local)  # volle Stage
+                # Crop anwenden
+                crop_rect = QRect(exp_x, exp_y, exp_w, exp_h)
+                crop_frame = frame.copy(crop_rect)
+                # in Pipe schreiben
+                ptr = crop_frame.bits()
+                ptr.setsize(crop_frame.byteCount())
                 proc.stdin.write(bytes(ptr))
                 local += int_speed
             proc.stdin.close()
             proc.wait()
-            QMessageBox.information(self, "Fertig", f"Export abgeschlossen. ~{secs:.2f}s, Frames {period} (Speed {int_speed}px/frame).")
+            QMessageBox.information(
+                self, "Fertig",
+                f"Export abgeschlossen. Frames {period}, Größe {exp_w}x{exp_h}@{self.cfg.fps}.\n"
+                f"Crop: {'aktiv' if self.crop_enable.isChecked() else 'aus'} ({exp_x},{exp_y},{exp_w},{exp_h})"
+            )
         except Exception as e:
             QMessageBox.critical(self, "Exportfehler", str(e))
 
