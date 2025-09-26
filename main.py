@@ -1317,7 +1317,7 @@ class Main(QMainWindow):
                 crop_frame = frame.copy(crop_rect)
                 # in Pipe schreiben
                 ptr = crop_frame.bits()
-                ptr.setsize(crop_frame.byteCount())
+                ptr.setsize(crop_frame.sizeInBytes())
                 proc.stdin.write(bytes(ptr))
                 local += int_speed
             proc.stdin.close()
