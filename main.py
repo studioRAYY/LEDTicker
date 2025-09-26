@@ -964,8 +964,7 @@ class Main(QMainWindow):
         self.preset.setdefault("output", {})["fps"] = self.cfg.fps
 
     # -------- Render mapping --------
-    @staticmethod
-    def _draw_wrapped_h(p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_x: int):
+    def _draw_wrapped_h(self, p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_x: int):
         W = src_img.width()  # erwartet strip.double_h => 2*text_w
         x = start_x % W
         remaining = dst_w
@@ -976,9 +975,8 @@ class Main(QMainWindow):
             remaining -= take
             dx += take
             x = 0
-            
-    @staticmethod
-    def _draw_wrapped_v(p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_y: int):
+    
+    def _draw_wrapped_v(self, p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_y: int):
         H = src_img.height()  # erwartet strip.double_v => 2*text_w
         y = start_y % H
         remaining = dst_h
@@ -1004,16 +1002,16 @@ class Main(QMainWindow):
             if dirv in ("left_right","right_left"):
                 reverse = (dirv == "right_left")
                 start_x = strip.tile_src_rect_h(offset_px, idx, reverse=reverse).x()
-                _draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
+                self._draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
     
             elif dirv in ("top_down","bottom_up"):
                 reverse = (dirv == "bottom_up")
                 start_y = strip.tile_src_rect_v(offset_px, idx, reverse=reverse).y()
-                _draw_wrapped_v(p, strip.double_v, dx, dy, dw, dh, start_y)
+                self._draw_wrapped_v(p, strip.double_v, dx, dy, dw, dh, start_y)
     
             else:
                 start_x = strip.tile_src_rect_h(offset_px, idx, reverse=False).x()
-                _draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
+                self._draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
         p.end()
         return frame
 
