@@ -964,6 +964,7 @@ class Main(QMainWindow):
         self.preset.setdefault("output", {})["fps"] = self.cfg.fps
 
     # -------- Render mapping --------
+    @staticmethod
     def _draw_wrapped_h(p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_x: int):
         W = src_img.width()  # erwartet strip.double_h => 2*text_w
         x = start_x % W
@@ -975,7 +976,8 @@ class Main(QMainWindow):
             remaining -= take
             dx += take
             x = 0
-    
+            
+    @staticmethod
     def _draw_wrapped_v(p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_y: int):
         H = src_img.height()  # erwartet strip.double_v => 2*text_w
         y = start_y % H
