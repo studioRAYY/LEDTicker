@@ -1,11 +1,12 @@
 # main.py — Studio Rayy Ticker (Mapping-Editor, vertikale/horizontale Laufrichtung,
 # Fullscreen-Fix, Pfadmodus-Umbenennung, Block-Dropdowns, freie Ausgabeauflösung,
-# Export-Zuschnitt/Crop, FFmpeg-Export)
+# Export-Zuschnitt/Crop, FFmpeg-Export, **Live-Content-Auswahl**)
 #
 # Tabs:
 # - Contents: mehrere Texte/Styles definieren (Font, Größe, Farben)
 # - Scheduler: zeitgesteuerter Wechsel (daily/date, Transition, Fade)
 # - Output: Live/Stop/Fullscreen, ROI-Overlay, Geschwindigkeit, Ausgabe-W/H/FPS,
+#           **Live-Content-Dropdown (Scheduler oder manuell)**,
 #           sowie Export MP4 inkl. frei wählbarem Crop (X,Y,W,H)
 # - Preset: laden/speichern/aktualisieren
 # - Mapping: Ports/Module/Blöcke konfigurieren (Mode, Pfadmodus "snake/reset",
@@ -17,6 +18,8 @@
 # - Vertikale Textdarstellung: Fix durch translate + rotate, damit Text sichtbar ist.
 # - tile_src_rect_v nutzt Modulo über 2*text_w (robusteres Sampling gegen double_v).
 # - Export unterstützt frei einstellbaren Zuschnitt (Crop) und dynamische Ausgabegröße/FPS.
+# - **Neu:** Live-Output kann explizit einen Content wählen (Dropdown). Fonts/Farben/Größe
+#   werden sofort übernommen, sobald Änderungen übernommen oder Content gewechselt wird.
 
 import sys, os, shutil, subprocess, json, datetime
 from math import gcd
@@ -88,7 +91,6 @@ def _gen_rects_new_port(port: dict, module_w: int, module_h: int) -> List[Tuple[
     sx = int(port.get("start", {}).get("x", 0))
     sy = int(port.get("start", {}).get("y", 0))
     mode = port.get("mode", "vertical")
-    # path_mode gelesen, derzeit noch ohne spezielle Phasenlogik verwendet
     _path_mode = port.get("path_mode", "snake")
     blocks = port.get("blocks", [])
     rects: List[Tuple[int,int,int,int,str]] = []
@@ -116,13 +118,11 @@ def _gen_rects_new_port(port: dict, module_w: int, module_h: int) -> List[Tuple[
                     rects.append( (cur_x, y, module_w, module_h, "top_down") )
                 cur_x += module_w
             else:
-                # falls horizontale dirs im vertical mode auftauchen, interpretiere als top_down
                 for k in range(count):
                     y = cur_y + k*module_h
                     rects.append( (cur_x, y, module_w, module_h, "top_down") )
                 cur_x += module_w
         else:
-            # horizontal mode
             if dirv == "left_right":
                 for k in range(count):
                     x = cur_x + k*module_w
@@ -162,7 +162,7 @@ def build_rois_from_preset(preset) -> List[PortROI]:
         if "start" in port or "mode" in port:
             rects = _gen_rects_new_port(port, module_w, module_h)
         else:
-            # extreme Altlast – einfache Migration mit Spaltenversatz
+            # extreme Altlast – einfache Migration
             x = int(port.get("x", 0))
             rects_tmp = []
             for blk in port.get("blocks", []):
@@ -252,17 +252,21 @@ class MasterStrip:
 
     # Horizontal Sampling (links->rechts)
     def tile_src_rect_h(self, offset_px: float, module_index: int, reverse=False) -> QRect:
-        base = (offset_px if not reverse else -offset_px)
-        x = int((base + module_index * self.module_w)) % self.text_w
+        if reverse:
+            # reverse: sowohl Offset als auch modulare Verschiebung negativ
+            x = int((-offset_px - module_index * self.module_w)) % self.text_w
+        else:
+            x = int(( offset_px + module_index * self.module_w)) % self.text_w
         return QRect(x, 0, self.module_w, self.module_h)
 
     # Vertikal Sampling (oben->unten). Modulo über double-Höhe robuster.
     def tile_src_rect_v(self, offset_px: float, module_index: int, reverse=False) -> QRect:
-        base = (offset_px if not reverse else -offset_px)
         period = 2 * self.text_w
-        y = int((base + module_index * self.module_h)) % max(1, period)
+        if reverse:
+            y = int((-offset_px - module_index * self.module_h)) % period
+        else:
+            y = int(( offset_px + module_index * self.module_h)) % period
         return QRect(0, y, self.module_w, self.module_h)
-
 # ----------------------------- Scheduler -----------------------------
 def parse_time(s: str) -> datetime.time:
     return datetime.time.fromisoformat(s)
@@ -369,6 +373,12 @@ class Main(QMainWindow):
         # Scheduler
         self.scheduler = Scheduler(self.contents, self.preset.get("scheduler", {}).get("entries", []))
         self.current_content_name = self.scheduler.pick_content_name() or self.preset["contents"][0]["name"]
+
+        # Live-Quelle (neu): "scheduler" | "manual"
+        self.live_source = "scheduler"
+        self.live_content_name: Optional[str] = None
+
+        # Crossfade
         self.next_content_name: Optional[str] = None
         self.crossfade_active = False
         self.crossfade_start: Optional[datetime.datetime] = None
@@ -462,6 +472,11 @@ class Main(QMainWindow):
         ctl.addWidget(QLabel("W"));  ctl.addWidget(self.out_w)
         ctl.addWidget(QLabel("H"));  ctl.addWidget(self.out_h)
         ctl.addWidget(QLabel("FPS")); ctl.addWidget(self.fps_box)
+
+        # **Neu: Live-Content-Auswahl**
+        self.live_content_cb = QComboBox()
+        ctl.addWidget(QLabel("Live-Content"))
+        ctl.addWidget(self.live_content_cb)
 
         # Laufgeschwindigkeit & Overlay & Controls
         self.speed = QDoubleSpinBox()
@@ -611,6 +626,10 @@ class Main(QMainWindow):
         self.out_h.valueChanged.connect(self.on_out_res_changed)
         self.fps_box.valueChanged.connect(self.on_fps_changed)
 
+        # **Neu: Live-Content-Änderung**
+        self.live_content_cb.currentTextChanged.connect(self.on_live_content_changed)
+        self.refresh_live_content_cb()  # Dropdown initial befüllen
+
         if self.contents_list.count() > 0:
             self.contents_list.setCurrentRow(0)
         self.load_scheduler_into_table()
@@ -619,7 +638,7 @@ class Main(QMainWindow):
         self.out_win = None
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
-        self.resize(1400, 980)
+        self.resize(1450, 1000)
 
     # -------- Initial Preset Load --------
     def load_initial_preset(self) -> dict:
@@ -684,6 +703,7 @@ class Main(QMainWindow):
         self.contents[base.name] = base
         self.contents_list.addItem(base.name)
         self.contents_list.setCurrentRow(self.contents_list.count()-1)
+        self.refresh_live_content_cb()
 
     def dup_content(self):
         cur = self.contents_list.currentItem()
@@ -698,6 +718,7 @@ class Main(QMainWindow):
         self.contents[new_name] = ContentItem(new_name, old.text, old.font_family, old.font_pt, old.text_rgb, old.bg_rgb)
         self.contents_list.addItem(new_name)
         self.contents_list.setCurrentRow(self.contents_list.count()-1)
+        self.refresh_live_content_cb()
 
     def del_content(self):
         cur = self.contents_list.currentItem()
@@ -706,6 +727,14 @@ class Main(QMainWindow):
         name = cur.text()
         self.contents.pop(name, None)
         self.contents_list.takeItem(self.contents_list.currentRow())
+        # Live-Auswahl korrigieren, falls gelöscht
+        if self.live_source == "manual" and self.live_content_name == name:
+            self.live_source = "scheduler"
+            self.live_content_name = None
+        if self.current_content_name == name:
+            self.current_content_name = next(iter(self.contents.keys()), None) or ""
+            self.strip_curr = self.make_strip(self.current_content_name)
+        self.refresh_live_content_cb()
 
     def make_strip(self, name: Optional[str]) -> Optional[MasterStrip]:
         if not name or name not in self.contents:
@@ -713,6 +742,45 @@ class Main(QMainWindow):
         c = self.contents[name]
         return MasterStrip(c.text, c.font_family, int(c.font_pt), c.text_rgb, c.bg_rgb,
                            self.module_w, self.module_h, self.num_modules)
+
+    # **Neu:** Live-Content Dropdown befüllen/aktualisieren
+    def refresh_live_content_cb(self):
+        current = self.live_content_cb.currentText() if self.live_content_cb.count() else None
+        self.live_content_cb.blockSignals(True)
+        self.live_content_cb.clear()
+        self.live_content_cb.addItem("Scheduler (auto)")
+        for name in self.contents.keys():
+            self.live_content_cb.addItem(name)
+        # Wiederherstellen
+        if self.live_source == "manual" and self.live_content_name in self.contents:
+            self.live_content_cb.setCurrentText(self.live_content_name)
+        else:
+            self.live_content_cb.setCurrentIndex(0)
+        self.live_content_cb.blockSignals(False)
+
+    # **Neu:** Reaktion auf Auswahlwechsel im Live-Content
+    def on_live_content_changed(self, text: str):
+        if text.startswith("Scheduler"):
+            self.live_source = "scheduler"
+            self.live_content_name = None
+            # Optional: sofort auf Scheduler-Inhalt wechseln (Cut)
+            target = self.scheduler.pick_content_name() or next(iter(self.contents.keys()), None)
+            if target and target != self.current_content_name:
+                self.current_content_name = target
+                self.strip_curr = self.make_strip(self.current_content_name)
+                self.crossfade_active = False; self.crossfade_start = None; self.strip_next = None
+            return
+
+        # manueller Inhalt
+        self.live_source = "manual"
+        self.live_content_name = text
+        if self.live_content_name != self.current_content_name:
+            self.current_content_name = self.live_content_name
+            self.strip_curr = self.make_strip(self.current_content_name)
+            self.crossfade_active = False; self.crossfade_start = None; self.strip_next = None
+        else:
+            # ggf. Fonts/Farben aktualisieren, falls geändert
+            self.strip_curr = self.make_strip(self.current_content_name)
 
     # -------- Scheduler Table --------
     def load_scheduler_into_table(self):
@@ -774,7 +842,6 @@ class Main(QMainWindow):
         if self.ports_list.count() > 0:
             self.ports_list.setCurrentRow(0)
         else:
-            # erster Port wenn leer
             self.preset.setdefault("ports", []).append({
                 "id":"port1", "start":{"x":0,"y":824}, "mode":"vertical", "path_mode":"snake",
                 "blocks":[{"dir":"bottom_up","count":4}]
@@ -841,17 +908,14 @@ class Main(QMainWindow):
             self.blocks_tbl.removeRow(r)
 
     def commit_mapping_from_gui(self):
-        # Globale Module
         self.preset.setdefault("module",{})["w"] = int(self.mod_w.value())
         self.preset.setdefault("module",{})["h"] = int(self.mod_h.value())
-        # Port Details
         p = self.current_port_ref()
         if not p:
             return
         old_id = p.get("id","")
         new_id = self.p_id.text().strip() or old_id
         p["id"] = new_id
-        # concat_port_order ggf. aktualisieren
         cpo = self.preset.setdefault("concat_port_order", [])
         for i, pid in enumerate(cpo):
             if pid == old_id:
@@ -860,7 +924,7 @@ class Main(QMainWindow):
         p.setdefault("start",{})["x"] = int(self.p_start_x.value())
         p.setdefault("start",{})["y"] = int(self.p_start_y.value())
         p["mode"] = self.p_mode.currentText()
-        p["path_mode"] = self.p_path_mode.currentText()  # "snake" | "reset"
+        p["path_mode"] = self.p_path_mode.currentText()
 
         blks = []
         for r in range(self.blocks_tbl.rowCount()):
@@ -875,7 +939,6 @@ class Main(QMainWindow):
             blks.append({"dir": dirv, "count": cnti})
         p["blocks"] = blks
 
-        # Ports-Liste-Name ggf. aktualisieren
         row = self.ports_list.currentRow()
         if row >= 0:
             self.ports_list.item(row).setText(new_id)
@@ -885,7 +948,6 @@ class Main(QMainWindow):
         QMessageBox.information(self, "Mapping", "Mapping wurde ins Preset übernommen (noch nicht gespeichert).")
 
     def apply_mapping_runtime(self):
-        # Übernehme GUI -> Preset -> Runtimestate
         self.commit_mapping_from_gui()
         self.apply_preset(self.preset)
         QMessageBox.information(self, "Mapping", "Mapping angewendet.")
@@ -894,7 +956,6 @@ class Main(QMainWindow):
     def on_out_res_changed(self):
         self.cfg.width = int(self.out_w.value())
         self.cfg.height = int(self.out_h.value())
-        # Preview rendert mit neuer Größe (render_mapped_frame erzeugt images in cfg-size)
 
     def on_fps_changed(self):
         self.cfg.fps = int(self.fps_box.value())
@@ -903,12 +964,14 @@ class Main(QMainWindow):
         self.preset.setdefault("output", {})["fps"] = self.cfg.fps
 
     # -------- Render mapping --------
-    def render_mapped_frame(self, strip: MasterStrip, offset_px: float) -> QImage:
+    def render_mapped_frame(self, strip: Optional[MasterStrip], offset_px: float) -> QImage:
         frame = QImage(self.cfg.width, self.cfg.height, QImage.Format_RGB888)
         bg = (0,0,0)
         if self.current_content_name in self.contents:
             bg = self.contents[self.current_content_name].bg_rgb
         frame.fill(QColor(*bg))
+        if strip is None:
+            return frame
         p = QPainter(frame)
         for idx, (dx,dy,dw,dh,dirv) in enumerate(self.dest_sequence):
             if dirv in ("left_right","right_left"):
@@ -973,21 +1036,31 @@ class Main(QMainWindow):
         return None, None
 
     def tick(self):
-        # Scheduler
-        target_name, entry = self.choose_target_content()
-        fallback = next(iter(self.contents.keys()), None)
-        desired = target_name or fallback or self.current_content_name
-        if desired != self.current_content_name and not self.crossfade_active:
-            trans = (entry or {}).get("transition","crossfade")
-            if trans == "cut":
+        # Quelle bestimmen
+        if self.live_source == "manual":
+            desired = self.live_content_name or next(iter(self.contents.keys()), None) or self.current_content_name
+            if desired != self.current_content_name:
                 self.current_content_name = desired
                 self.strip_curr = self.make_strip(self.current_content_name)
-            else:
-                self.next_content_name = desired
-                self.strip_next = self.make_strip(self.next_content_name)
-                self.crossfade_ms = int((entry or {}).get("fade_ms", 800))
-                self.crossfade_active = True
-                self.crossfade_start = datetime.datetime.now()
+                self.strip_next = None
+                self.crossfade_active = False
+                self.crossfade_start = None
+        else:
+            # Scheduler-Modus
+            target_name, entry = self.choose_target_content()
+            fallback = next(iter(self.contents.keys()), None)
+            desired = target_name or fallback or self.current_content_name
+            if desired != self.current_content_name and not self.crossfade_active:
+                trans = (entry or {}).get("transition","crossfade")
+                if trans == "cut":
+                    self.current_content_name = desired
+                    self.strip_curr = self.make_strip(self.current_content_name)
+                else:
+                    self.next_content_name = desired
+                    self.strip_next = self.make_strip(self.next_content_name)
+                    self.crossfade_ms = int((entry or {}).get("fade_ms", 800))
+                    self.crossfade_active = True
+                    self.crossfade_start = datetime.datetime.now()
 
         # Bewegung
         self.cfg.speed_px_per_frame = float(self.speed.value())
@@ -995,7 +1068,7 @@ class Main(QMainWindow):
 
         base_curr = self.render_mapped_frame(self.strip_curr, self.offset)
         frame = base_curr
-        if self.crossfade_active and self.strip_next is not None and self.crossfade_start is not None:
+        if self.live_source == "scheduler" and self.crossfade_active and self.strip_next is not None and self.crossfade_start is not None:
             elapsed = (datetime.datetime.now() - self.crossfade_start).total_seconds()*1000.0
             a = max(0.0, min(1.0, elapsed / max(1, self.crossfade_ms)))
             base_next = self.render_mapped_frame(self.strip_next, self.offset)
@@ -1104,7 +1177,6 @@ class Main(QMainWindow):
         self.scheduler = Scheduler(self.contents, p.get("scheduler", {}).get("entries", []))
         self.tbl.setRowCount(0)
         self.load_scheduler_into_table()
-
         self.load_mapping_into_gui()
 
         # Output übernehmen
@@ -1115,6 +1187,9 @@ class Main(QMainWindow):
         self.out_w.setValue(self.cfg.width)
         self.out_h.setValue(self.cfg.height)
         self.fps_box.setValue(self.cfg.fps)
+
+        # Live-Content-Liste aktualisieren (Dropdown)
+        self.refresh_live_content_cb()
 
         self.current_content_name = self.scheduler.pick_content_name() or p["contents"][0]["name"]
         self.strip_curr = self.make_strip(self.current_content_name)
@@ -1128,6 +1203,7 @@ class Main(QMainWindow):
         if not name:
             return
         cur_item = self.contents_list.currentItem()
+        # Rename-Logik
         if cur_item and name != cur_item.text():
             if name in self.contents:
                 QMessageBox.warning(self, "Hinweis", "Name existiert bereits.")
@@ -1137,12 +1213,26 @@ class Main(QMainWindow):
             c.name = name
             self.contents[name] = c
             cur_item.setText(name)
+            # **Neu:** Live-/Current-Namen fortschreiben
+            if self.current_content_name == old_name:
+                self.current_content_name = name
+            if self.live_source == "manual" and self.live_content_name == old_name:
+                self.live_content_name = name
+        # Sicherstellen, dass Eintrag existiert
         if name not in self.contents:
             self.contents[name] = ContentItem(name, "", "Arial", 72, (255,255,255), (0,0,0))
         c = self.contents[name]
+        # Änderungen übernehmen
         c.text = self.c_text.text()
         c.font_family = self.c_font.currentFont().family()
         c.font_pt = int(self.c_size.value())
+
+        # **Neu:** Falls der aktuell sichtbare Content geändert wurde → Strip neu bauen (Fonts/Farben sofort live)
+        if self.current_content_name == name:
+            self.strip_curr = self.make_strip(self.current_content_name)
+
+        # Dropdown aktualisieren
+        self.refresh_live_content_cb()
 
     # -------- Export --------
     def export_video(self):
@@ -1154,7 +1244,7 @@ class Main(QMainWindow):
             QMessageBox.critical(self, "Fehler", "Kein Content ausgewählt.")
             return
         int_speed = max(1, int(round(self.cfg.speed_px_per_frame)))
-        period = self.strip_curr.period_frames(int_speed)
+        period = self.strip_curr.period_frames(int_speed) if self.strip_curr else int(self.cfg.fps)
         path, _ = QFileDialog.getSaveFileName(self, "Export", os.path.join(os.path.expanduser("~"), "ticker_export.mp4"), "MP4 (*.mp4)")
         if not path:
             return
@@ -1192,7 +1282,7 @@ class Main(QMainWindow):
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
             local = 0.0
             for _ in range(period):
-                frame = self.render_mapped_frame(self.strip_curr, local)  # volle Stage
+                frame = self.render_mapped_frame(self.strip_curr, self.offset + local)  # volle Stage
                 # Crop anwenden
                 crop_rect = QRect(exp_x, exp_y, exp_w, exp_h)
                 crop_frame = frame.copy(crop_rect)
