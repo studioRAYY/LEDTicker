@@ -3,7 +3,7 @@
   "output": {
     "width": 1920,
     "height": 1080,
-    "fps": 50
+    "fps": 60
   },
   "module": {
     "w": 128,
@@ -15,36 +15,48 @@
       "x": 0,
       "blocks": [
         {
-          "order": "bottom_up",
+          "dir": "bottom_up",
           "count": 4
         },
         {
-          "order": "top_down",
+          "dir": "bottom_up",
           "count": 4
         },
         {
-          "order": "bottom_up",
+          "dir": "bottom_up",
           "count": 4
         }
-      ]
+      ],
+      "start": {
+        "x": 0,
+        "y": 768
+      },
+      "mode": "vertical",
+      "path_mode": "snake"
     },
     {
       "id": "port2",
       "x": 128,
       "blocks": [
         {
-          "order": "bottom_up",
+          "dir": "bottom_up",
           "count": 4
         },
         {
-          "order": "top_down",
+          "dir": "bottom_up",
           "count": 4
         },
         {
-          "order": "bottom_up",
+          "dir": "bottom_up",
           "count": 4
         }
-      ]
+      ],
+      "start": {
+        "x": 384,
+        "y": 768
+      },
+      "mode": "vertical",
+      "path_mode": "snake"
     }
   ],
   "concat_port_order": [
@@ -53,9 +65,41 @@
   ],
   "contents": [
     {
-      "name": "Default",
-      "text": "STUDIO RAYY \u2014 MULTI CONTENT \u2014 ",
-      "font_family": "Arial",
+      "name": "Montag",
+      "text": "JLL +++ SEE A BRIGHTER WAY +++ 15:00 Uhr +++ Halle A1 Raum A11 +++ Maximize impact: How to reposition assets and cities? +++ ",
+      "font_family": "Unibody 8 Pro",
+      "font_pt": 72,
+      "text_rgb": [
+        255,
+        255,
+        255
+      ],
+      "bg_rgb": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "Dienstag",
+      "text": "JLL +++ SEE A BRIGHTER WAY +++ 9:30 Uhr +++ Halle B2 Raum B21 +++ Verteidigungsindustrie \u2013 Chance f\u00fcr die Immobilienwirtschaft? +++ 11:00 Uhr +++ Halle B2 Raum B21 +++ Zwischen Wohnungsnot und Bauturbo \u2013 Wohin steuert der deutsche Immobilienmarkt? +++ 14:00 Uhr +++ Halle B1 DNF B\u00fchne +++ Kompromisslose Rendite oder kalkuliertes Risiko? +++ 15:00 Uhr +++ Halle B2 Raum B22 +++ Next-Gen Business Hubs: B\u00fcroinvestitionen in den Stadtteilen von morgen +++ ",
+      "font_family": "Unibody 8 Pro",
+      "font_pt": 72,
+      "text_rgb": [
+        255,
+        255,
+        255
+      ],
+      "bg_rgb": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "Mittwoch",
+      "text": "JLL +++ SEE A BRIGHTER WAY +++ Vielen Dank f\u00fcr Ihren Besuch am JLL Stand +++ ",
+      "font_family": "Unibody 8 Pro",
       "font_pt": 72,
       "text_rgb": [
         255,
