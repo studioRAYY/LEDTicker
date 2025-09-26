@@ -38,6 +38,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.py }}
@@ -48,46 +49,53 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller==6.6
 
-      - name: Install FFmpeg (macOS)
+      # ==== STATIC FFMPEG (macOS) ====
+      - name: Download static FFmpeg (macOS)
         if: matrix.os == 'macos-latest'
-        run: |
-          brew install ffmpeg
-          which ffmpeg
-          ffmpeg -version
-
-      - name: Install FFmpeg (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          choco install ffmpeg -y
-          where ffmpeg
-          ffmpeg -version
-
-      - name: Resolve FFmpeg path
-        id: ff
         shell: bash
         run: |
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            echo "ff=$(which ffmpeg)" >> $GITHUB_OUTPUT
-          else
-            echo "ff=$(where ffmpeg | head -n 1 | tr -d '\r')" >> $GITHUB_OUTPUT
-          fi
+          set -euo pipefail
+          mkdir -p ffmpeg_static
+          # Evermeet liefert ein einzelnes, statisch gelinktes 'ffmpeg'
+          curl -L -o ffmpeg.zip "https://evermeet.cx/ffmpeg/ffmpeg-6.1.zip"
+          unzip -j ffmpeg.zip -d ffmpeg_static
+          chmod +x ffmpeg_static/ffmpeg
+          ./ffmpeg_static/ffmpeg -version
+
+      # ==== STATIC FFMPEG (Windows) ====
+      - name: Download static FFmpeg (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          New-Item -ItemType Directory -Force -Path ffmpeg_static | Out-Null
+          $url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          Invoke-WebRequest -Uri $url -OutFile "ffmpeg.zip"
+          Expand-Archive -Path "ffmpeg.zip" -DestinationPath "ffmpeg_extracted" -Force
+          $bin = Get-ChildItem -Path "ffmpeg_extracted" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          Copy-Item $bin.FullName "ffmpeg_static\ffmpeg.exe" -Force
+          .\ffmpeg_static\ffmpeg.exe -version
 
       - name: PyInstaller build
         shell: bash
         run: |
+          set -euo pipefail
           SEP="${{ matrix.add_data_sep }}"
+          # Endung für Windows
+          if [ "${{ runner.os }}" = "Windows" ]; then EXT=".exe"; else EXT=""; fi
           pyinstaller \
             --name "StudioRayyTicker" \
             --windowed \
             --onefile \
             --noconfirm \
             --add-data "presets${SEP}presets" \
-            --add-binary "${{ steps.ff.outputs.ff }}${SEP}ffmpeg" \
+            --add-binary "ffmpeg_static/ffmpeg${EXT}${SEP}ffmpeg${EXT}" \
             main.py
 
       - name: Package artifact
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist_pkg
           [ -f README.md ] && cp -f README.md dist_pkg/ || true
           if [ "${{ runner.os }}" = "macOS" ]; then
