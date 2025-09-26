@@ -964,6 +964,30 @@ class Main(QMainWindow):
         self.preset.setdefault("output", {})["fps"] = self.cfg.fps
 
     # -------- Render mapping --------
+    def _draw_wrapped_h(p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_x: int):
+        W = src_img.width()  # erwartet strip.double_h => 2*text_w
+        x = start_x % W
+        remaining = dst_w
+        dx = dst_x
+        while remaining > 0:
+            take = min(remaining, W - x)
+            p.drawImage(QRect(dx, dst_y, take, dst_h), src_img, QRect(x, 0, take, src_img.height()))
+            remaining -= take
+            dx += take
+            x = 0
+    
+    def _draw_wrapped_v(p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_y: int):
+        H = src_img.height()  # erwartet strip.double_v => 2*text_w
+        y = start_y % H
+        remaining = dst_h
+        dy = dst_y
+        while remaining > 0:
+            take = min(remaining, H - y)
+            p.drawImage(QRect(dst_x, dy, dst_w, take), src_img, QRect(0, y, src_img.width(), take))
+            remaining -= take
+            dy += take
+            y = 0
+    
     def render_mapped_frame(self, strip: Optional[MasterStrip], offset_px: float) -> QImage:
         frame = QImage(self.cfg.width, self.cfg.height, QImage.Format_RGB888)
         bg = (0,0,0)
@@ -972,17 +996,22 @@ class Main(QMainWindow):
         frame.fill(QColor(*bg))
         if strip is None:
             return frame
+    
         p = QPainter(frame)
         for idx, (dx,dy,dw,dh,dirv) in enumerate(self.dest_sequence):
             if dirv in ("left_right","right_left"):
-                src = strip.tile_src_rect_h(offset_px, idx, reverse=(dirv=="right_left"))
-                p.drawImage(QRect(dx,dy,dw,dh), strip.double_h, src)
+                reverse = (dirv == "right_left")
+                start_x = strip.tile_src_rect_h(offset_px, idx, reverse=reverse).x()
+                _draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
+    
             elif dirv in ("top_down","bottom_up"):
-                src = strip.tile_src_rect_v(offset_px, idx, reverse=(dirv=="bottom_up"))
-                p.drawImage(QRect(dx,dy,dw,dh), strip.double_v, src)
+                reverse = (dirv == "bottom_up")
+                start_y = strip.tile_src_rect_v(offset_px, idx, reverse=reverse).y()
+                _draw_wrapped_v(p, strip.double_v, dx, dy, dw, dh, start_y)
+    
             else:
-                src = strip.tile_src_rect_h(offset_px, idx, reverse=False)
-                p.drawImage(QRect(dx,dy,dw,dh), strip.double_h, src)
+                start_x = strip.tile_src_rect_h(offset_px, idx, reverse=False).x()
+                _draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
         p.end()
         return frame
 
