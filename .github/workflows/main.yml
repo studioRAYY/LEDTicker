@@ -56,7 +56,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ffmpeg_static
-          # Evermeet liefert ein einzelnes, statisch gelinktes 'ffmpeg'
           curl -L -o ffmpeg.zip "https://evermeet.cx/ffmpeg/ffmpeg-6.1.zip"
           unzip -j ffmpeg.zip -d ffmpeg_static
           chmod +x ffmpeg_static/ffmpeg
@@ -76,13 +75,14 @@ jobs:
           Copy-Item $bin.FullName "ffmpeg_static\ffmpeg.exe" -Force
           .\ffmpeg_static\ffmpeg.exe -version
 
-      - name: PyInstaller build
+      # ==== Build with PyInstaller ====
+      - name: PyInstaller build (macOS/Windows)
         shell: bash
         run: |
           set -euo pipefail
           SEP="${{ matrix.add_data_sep }}"
-          # Endung für Windows
           if [ "${{ runner.os }}" = "Windows" ]; then EXT=".exe"; else EXT=""; fi
+          # --windowed sorgt dafür, dass auf macOS eine .app entsteht (keine Terminal-App).
           pyinstaller \
             --name "StudioRayyTicker" \
             --windowed \
@@ -92,23 +92,55 @@ jobs:
             --add-binary "ffmpeg_static/ffmpeg${EXT}${SEP}ffmpeg${EXT}" \
             main.py
 
-      - name: Package artifact
+      # ==== Prepare artifacts & DMG (macOS) ====
+      - name: Package macOS .app and create DMG
+        if: matrix.os == 'macos-latest'
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist_pkg
-          [ -f README.md ] && cp -f README.md dist_pkg/ || true
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            cp -f dist/StudioRayyTicker dist_pkg/StudioRayyTicker-macOS
-          else
-            cp -f dist/StudioRayyTicker.exe dist_pkg/StudioRayyTicker-Windows.exe
-          fi
-          [ -d presets ] && cp -r presets dist_pkg/presets
+          APP="dist/StudioRayyTicker.app"
+
+          # Sanity check
+          [ -d "$APP" ] || { echo "App bundle not found at $APP"; ls -la dist; exit 1; }
+
+          # Optional: ad-hoc sign to avoid quarantine warnings in some contexts
+          codesign --force --deep -s - "$APP" || true
+
+          # DMG source folder
+          mkdir -p dmg_src
+          cp -R "$APP" dmg_src/
+          ln -s /Applications dmg_src/Applications
+
+          # Create DMG
+          hdiutil create -volname "StudioRayyTicker" -srcfolder dmg_src -ov -format UDZO "dist/StudioRayyTicker-macOS.dmg"
+
+      # ==== Prepare artifacts (Windows) ====
+      - name: Package Windows artifact
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          New-Item -ItemType Directory -Force -Path dist_pkg | Out-Null
+          Copy-Item -Path "dist/StudioRayyTicker.exe" -Destination "dist_pkg/StudioRayyTicker-Windows.exe" -Force
+          if (Test-Path "README.md") { Copy-Item "README.md" "dist_pkg/README.md" -Force }
+          if (Test-Path "presets")   { Copy-Item "presets" "dist_pkg/presets" -Recurse -Force }
+          Compress-Archive -Path "dist_pkg/*" -DestinationPath "dist/StudioRayyTicker-Windows.zip" -Force
+
+      # ==== Upload artifacts ====
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'macos-latest'
+        with:
+          name: StudioRayyTicker-macOS
+          path: |
+            dist/StudioRayyTicker.app
+            dist/StudioRayyTicker-macOS.dmg
 
       - uses: actions/upload-artifact@v4
+        if: matrix.os == 'windows-latest'
         with:
-          name: StudioRayyTicker-${{ matrix.artifact_suffix }}
-          path: dist_pkg/
+          name: StudioRayyTicker-Windows
+          path: |
+            dist/StudioRayyTicker-Windows.zip
 
   release:
     if: ${{ github.event.inputs.release == 'true' }}
@@ -118,11 +150,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: ./artifacts
+
       - name: Ensure tag provided
         if: ${{ github.event.inputs.tag == '' }}
         run: |
           echo "ERROR: You must provide a tag when release=true" >&2
           exit 1
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag }}
