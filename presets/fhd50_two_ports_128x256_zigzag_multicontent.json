@@ -3,7 +3,8 @@
   "output": {
     "width": 1920,
     "height": 1080,
-    "fps": 50
+    "fps": 50,
+    "speed_px_per_frame": 1.0
   },
   "module": {
     "w": 128,
