@@ -76,20 +76,33 @@ jobs:
           .\ffmpeg_static\ffmpeg.exe -version
 
       # ==== Build with PyInstaller ====
-      - name: PyInstaller build (macOS/Windows)
+      - name: PyInstaller build (macOS)
+        if: matrix.os == 'macos-latest'
         shell: bash
         run: |
           set -euo pipefail
           SEP="${{ matrix.add_data_sep }}"
-          if [ "${{ runner.os }}" = "Windows" ]; then EXT=".exe"; else EXT=""; fi
-          # --windowed sorgt dafür, dass auf macOS eine .app entsteht (keine Terminal-App).
           pyinstaller \
             --name "StudioRayyTicker" \
             --windowed \
             --onefile \
             --noconfirm \
             --add-data "presets${SEP}presets" \
-            --add-binary "ffmpeg_static/ffmpeg${EXT}${SEP}ffmpeg${EXT}" \
+            --add-binary "ffmpeg_static/ffmpeg${SEP}ffmpeg" \
+            main.py
+      
+      - name: PyInstaller build (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $sep = "${{ matrix.add_data_sep }}"
+          pyinstaller `
+            --name "StudioRayyTicker" `
+            --windowed `
+            --onefile `
+            --noconfirm `
+            --add-data "presets${sep}presets" `
+            --add-binary "ffmpeg_static/ffmpeg.exe${sep}ffmpeg.exe" `
             main.py
 
       # ==== Prepare artifacts & DMG (macOS) ====
