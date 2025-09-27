@@ -1016,16 +1016,16 @@ class Main(QMainWindow):
             if dirv in ("left_right","right_left"):
                 reverse = (dirv == "right_left")
                 start_x = strip.tile_src_rect_h(offset_px, idx, reverse=reverse).x()
-                _draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
+                self._draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
     
             elif dirv in ("top_down","bottom_up"):
                 reverse = (dirv == "bottom_up")
                 start_y = strip.tile_src_rect_v(offset_px, idx, reverse=reverse).y()
-                _draw_wrapped_v(p, strip.double_v, dx, dy, dw, dh, start_y)
+                self._draw_wrapped_v(p, strip.double_v, dx, dy, dw, dh, start_y)
     
             else:
                 start_x = strip.tile_src_rect_h(offset_px, idx, reverse=False).x()
-                _draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
+                self._draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
         p.end()
         return frame
 
