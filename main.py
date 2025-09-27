@@ -1189,7 +1189,7 @@ class Main(QMainWindow):
             "output": {
                 "width": int(self.out_w.value()),
                 "height": int(self.out_h.value()),
-                "fps": int(self.fps_box.value())
+                "fps": int(self.fps_box.value()),
                 "speed_px_per_frame": float(self.speed.value())
             },
             "module": {"w": int(self.mod_w.value()), "h": int(self.mod_h.value())},
