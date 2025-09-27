@@ -379,6 +379,7 @@ class Main(QMainWindow):
         self.cfg.width  = int(out.get("width",  self.cfg.width))
         self.cfg.height = int(out.get("height", self.cfg.height))
         self.cfg.fps    = int(out.get("fps",    self.cfg.fps))
+        self.cfg.speed_px_per_frame = float(out.get("speed_px_per_frame", self.cfg.speed_px_per_frame))
 
         # Scheduler
         self.scheduler = Scheduler(self.contents, self.preset.get("scheduler", {}).get("entries", []))
@@ -490,10 +491,11 @@ class Main(QMainWindow):
 
         # Laufgeschwindigkeit & Overlay & Controls
         self.speed = QDoubleSpinBox()
-        self.speed.setRange(0.1, 200.0)
+        self.speed.setRange(0.01, 200.0)
         self.speed.setDecimals(1)
-        self.speed.setSingleStep(0.1)
+        self.speed.setSingleStep(0.05)
         self.speed.setValue(self.cfg.speed_px_per_frame)
+        self.speed.valueChanged.connect(self.on_speed_changed)
         self.overlay_chk = QCheckBox("ROI-Overlay")
         self.overlay_chk.setChecked(True)
         self.live_btn = QPushButton("Live")
@@ -667,7 +669,7 @@ class Main(QMainWindow):
         self.current_preset_path = None
         return {
             "name": "Default_FHD50",
-            "output": {"width": 1920, "height": 1080, "fps": 50},
+            "output": {"width": 1920, "height": 1080, "fps": 50, "speed_px_per_frame": 1.0},
             "module": {"w": 128, "h": 256},
             "ports": [
                 {"id":"port1","start":{"x":0,"y":824},"mode":"vertical","path_mode":"snake",
@@ -975,7 +977,11 @@ class Main(QMainWindow):
         if self.timer.isActive():
             self.timer.start(int(1000 / max(1, self.cfg.fps)))
         self.preset.setdefault("output", {})["fps"] = self.cfg.fps
-
+    # NEU: Speed-Änderungen fortschreiben
+    def on_speed_changed(self):
+        self.cfg.speed_px_per_frame = float(self.speed.value())
+        self.preset.setdefault("output", {})["speed_px_per_frame"] = self.cfg.speed_px_per_frame
+        
     # -------- Render mapping --------
     @staticmethod
     def _draw_wrapped_h(p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_x: int):
@@ -1184,6 +1190,7 @@ class Main(QMainWindow):
                 "width": int(self.out_w.value()),
                 "height": int(self.out_h.value()),
                 "fps": int(self.fps_box.value())
+                "speed_px_per_frame": float(self.speed.value())
             },
             "module": {"w": int(self.mod_w.value()), "h": int(self.mod_h.value())},
             "ports": self.preset.get("ports", []),
@@ -1259,7 +1266,8 @@ class Main(QMainWindow):
         self.out_w.setValue(self.cfg.width)
         self.out_h.setValue(self.cfg.height)
         self.fps_box.setValue(self.cfg.fps)
-
+        self.speed.setValue(self.cfg.speed_px_per_frame)
+        
         # Live-Content-Liste aktualisieren (Dropdown)
         self.refresh_live_content_cb()
 
