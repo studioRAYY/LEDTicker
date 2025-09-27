@@ -25,6 +25,7 @@ import sys, os, shutil, subprocess, json, datetime
 from math import gcd
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
+from collections import deque
 
 from PySide6.QtCore import Qt, QTimer, QRect
 from PySide6.QtGui import QPainter, QImage, QColor, QFont, QFontMetrics, QGuiApplication
@@ -317,6 +318,8 @@ class OutputWindow(QWidget):
     def __init__(self, w: int, h: int):
         super().__init__()
         self.setWindowTitle("Ticker Output")
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.frame = QImage(w,h,QImage.Format_RGB888)
         self.frame.fill(Qt.black)
     def set_frame(self, img: QImage):
@@ -325,7 +328,7 @@ class OutputWindow(QWidget):
         p = QPainter(self)
         r = self.rect()
         p.fillRect(r, Qt.black)
-        scaled = self.frame.scaled(r.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled = self.frame.scaled(r.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
         p.drawImage((r.width()-scaled.width())//2,(r.height()-scaled.height())//2, scaled)
         p.end()
 
@@ -336,6 +339,13 @@ class Main(QMainWindow):
         self.setWindowTitle("Studio Rayy — Multi-Content Ticker (Master-Strip)")
         self.cfg = CFG()
         self.offset = 0.0
+        # Offscreen frame buffer reused each frame
+        self.frame_buffer = QImage(self.cfg.width, self.cfg.height, QImage.Format_RGB888)
+        self.frame_buffer.fill(Qt.black)
+        # FPS tracking
+        self._fps_times = deque(maxlen=180)
+        self._fps_value = 0.0
+
         self.current_preset_path: Optional[str] = None
 
         # Preset robust laden (Fallback: in-code Default)
@@ -956,6 +966,9 @@ class Main(QMainWindow):
     def on_out_res_changed(self):
         self.cfg.width = int(self.out_w.value())
         self.cfg.height = int(self.out_h.value())
+        # Recreate frame buffer to match resolution
+        self.frame_buffer = QImage(self.cfg.width, self.cfg.height, QImage.Format_RGB888)
+        self.frame_buffer.fill(Qt.black)
 
     def on_fps_changed(self):
         self.cfg.fps = int(self.fps_box.value())
@@ -964,7 +977,7 @@ class Main(QMainWindow):
         self.preset.setdefault("output", {})["fps"] = self.cfg.fps
 
     # -------- Render mapping --------
-    def _draw_wrapped_h(self, p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_x: int):
+    def _draw_wrapped_h(p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_x: int):
         W = src_img.width()  # erwartet strip.double_h => 2*text_w
         x = start_x % W
         remaining = dst_w
@@ -976,7 +989,7 @@ class Main(QMainWindow):
             dx += take
             x = 0
     
-    def _draw_wrapped_v(self, p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_y: int):
+    def _draw_wrapped_v(p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_y: int):
         H = src_img.height()  # erwartet strip.double_v => 2*text_w
         y = start_y % H
         remaining = dst_h
@@ -989,7 +1002,8 @@ class Main(QMainWindow):
             y = 0
     
     def render_mapped_frame(self, strip: Optional[MasterStrip], offset_px: float) -> QImage:
-        frame = QImage(self.cfg.width, self.cfg.height, QImage.Format_RGB888)
+        # reuse offscreen buffer
+        frame = self.frame_buffer
         bg = (0,0,0)
         if self.current_content_name in self.contents:
             bg = self.contents[self.current_content_name].bg_rgb
@@ -1002,18 +1016,34 @@ class Main(QMainWindow):
             if dirv in ("left_right","right_left"):
                 reverse = (dirv == "right_left")
                 start_x = strip.tile_src_rect_h(offset_px, idx, reverse=reverse).x()
-                self._draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
+                _draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
     
             elif dirv in ("top_down","bottom_up"):
                 reverse = (dirv == "bottom_up")
                 start_y = strip.tile_src_rect_v(offset_px, idx, reverse=reverse).y()
-                self._draw_wrapped_v(p, strip.double_v, dx, dy, dw, dh, start_y)
+                _draw_wrapped_v(p, strip.double_v, dx, dy, dw, dh, start_y)
     
             else:
                 start_x = strip.tile_src_rect_h(offset_px, idx, reverse=False).x()
-                self._draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
+                _draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
         p.end()
         return frame
+
+    def draw_fps_overlay(self, img: QImage, fps: float):
+        p = QPainter(img)
+        p.setRenderHint(QPainter.TextAntialiasing, False)
+        # small semi-transparent box
+        rect_w, rect_h = 110, 36
+        margin = 8
+        x = img.width() - rect_w - margin
+        y = margin
+        # background
+        p.fillRect(QRect(x, y, rect_w, rect_h), QColor(0,0,0,160))
+        p.setPen(QColor(255,255,255))
+        p.setFont(QFont("Arial", 12))
+        text = f"FPS: {fps:0.1f}"
+        p.drawText(x+10, y+22, text)
+        p.end()
 
     # -------- Loop --------
     def start_live(self):
@@ -1108,6 +1138,17 @@ class Main(QMainWindow):
                 self.strip_next = None
                 self.crossfade_active = False
                 self.crossfade_start = None
+
+        # --- FPS tracking ---
+        now_ms = datetime.datetime.now().timestamp() * 1000.0
+        self._fps_times.append(now_ms)
+        if len(self._fps_times) >= 6:
+            span = self._fps_times[-1] - self._fps_times[0]
+            if span > 0:
+                self._fps_value = 1000.0 * (len(self._fps_times)-1) / span
+
+        # Draw FPS overlay onto the display frame (non-invasive to export pipeline)
+        self.draw_fps_overlay(frame, self._fps_value)
 
         vis = draw_roi_overlay(frame, self.rois_ports) if self.overlay_chk.isChecked() else frame
         self.preview.set_frame(vis)
@@ -1226,6 +1267,13 @@ class Main(QMainWindow):
         self.crossfade_active = False
         self.crossfade_start = None
         self.offset = 0.0
+        # Offscreen frame buffer reused each frame
+        self.frame_buffer = QImage(self.cfg.width, self.cfg.height, QImage.Format_RGB888)
+        self.frame_buffer.fill(Qt.black)
+        # FPS tracking
+        self._fps_times = deque(maxlen=180)
+        self._fps_value = 0.0
+
 
     def commit_current_content_edits(self):
         name = self.c_name.text().strip()
