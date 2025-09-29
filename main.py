@@ -1,27 +1,26 @@
 # main.py — Studio Rayy Ticker (Mapping-Editor, vertikale/horizontale Laufrichtung,
 # Fullscreen-Fix, Pfadmodus-Umbenennung, Block-Dropdowns, freie Ausgabeauflösung,
-# Export-Zuschnitt/Crop, FFmpeg-Export, **Live-Content-Auswahl**, **180°-Rotation**)
+# Export-Zuschnitt/Crop, FFmpeg-Export, Live-Content-Auswahl, 180°-Rotation,
+# **Laufrichtung umschaltbar (vorwärts/rückwärts)**)
 #
 # Tabs:
 # - Contents: mehrere Texte/Styles definieren (Font, Größe, Farben)
 # - Scheduler: zeitgesteuerter Wechsel (daily/date, Transition, Fade)
 # - Output: Live/Stop/Fullscreen, ROI-Overlay, Geschwindigkeit, Ausgabe-W/H/FPS,
-#           **Live-Content-Dropdown (Scheduler oder manuell)**,
-#           **Text 180° drehen (Checkbox)**,
+#           Live-Content-Dropdown (Scheduler oder manuell),
+#           Text 180° drehen (Checkbox),
+#           **Laufrichtung (vorwärts/rückwärts)**,
 #           sowie Export MP4 inkl. frei wählbarem Crop (X,Y,W,H)
 # - Preset: laden/speichern/aktualisieren
 # - Mapping: Ports/Module/Blöcke konfigurieren (Mode, Pfadmodus "snake/reset",
 #            Block-Direction per Dropdown)
 #
 # Hinweise:
-# - "Pfadmodus" ersetzt das frühere "ZigZag"-Flag. (Die eigentliche Schlangen-Phasenlogik
-#   kann auf Wunsch zusätzlich eingebaut werden; aktuell bleibt die Phasenführung wie zuvor.)
-# - Vertikale Textdarstellung: Fix durch translate + rotate, damit Text sichtbar ist.
-# - tile_src_rect_v nutzt Modulo über 2*text_w (robusteres Sampling gegen double_v).
-# - Export unterstützt frei einstellbaren Zuschnitt (Crop) und dynamische Ausgabegröße/FPS.
-# - **Neu:** Live-Output kann explizit einen Content wählen (Dropdown). Fonts/Farben/Größe
-#   werden sofort übernommen, sobald Änderungen übernommen oder Content gewechselt wird.
-# - **Neu:** Option „Text 180° drehen“ (GUI-Checkbox), live wirksam und im Preset speicher-/ladbar.
+# - "Pfadmodus" ersetzt das frühere "ZigZag"-Flag. Die Schlangen-Phasenlogik bleibt wie zuvor.
+# - Vertikale Textdarstellung: über translate + rotate sichtbar.
+# - tile_src_rect_v nutzt Modulo über 2*text_w.
+# - Export unterstützt frei einstellbaren Zuschnitt und dynamische Ausgabegröße/FPS.
+# - Neu: 180°-Rotation optional; Laufrichtung global umschaltbar.
 
 import sys, os, shutil, subprocess, json, datetime
 from math import gcd
@@ -67,7 +66,8 @@ class CFG:
     height: int = 1080
     fps: int = 50
     speed_px_per_frame: float = 4.0  # "Geschwindigkeit"
-    rotate180: bool = False          # **NEU**: 180°-Drehung
+    rotate180: bool = False          # 180°-Drehung
+    direction: str = "forward"       # **NEU**: "forward" | "reverse"
 
 # ----------------------------- Mapping Structures -----------------------------
 class PortROI:
@@ -77,21 +77,6 @@ class PortROI:
         self.rects = rects
 
 def _gen_rects_new_port(port: dict, module_w: int, module_h: int) -> List[Tuple[int,int,int,int,str]]:
-    """
-    Neues Mapping-Format:
-      {
-        "id": "port1",
-        "start": {"x": 0, "y": 824},
-        "mode": "vertical"|"horizontal",
-        "path_mode": "snake"|"reset",   # (ersetzt früheres "zigzag")
-        "blocks": [ {"dir":"bottom_up","count":4}, {"dir":"top_down","count":4}, ... ]
-      }
-    Regeln (Geometrie):
-     - mode=vertical: jeder Block beschreibt eine Spalte; innerhalb davon werden count Module in y-Richtung gestapelt.
-       Danach springt X um module_w weiter (neue Spalte).
-     - mode=horizontal: analog für Zeilen.
-     - dir steuert außerdem die Textlaufrichtung pro Kachel (links->rechts, rechts->links, unten->oben, oben->unten).
-    """
     sx = int(port.get("start", {}).get("x", 0))
     sy = int(port.get("start", {}).get("y", 0))
     mode = port.get("mode", "vertical")
@@ -146,7 +131,6 @@ def _gen_rects_new_port(port: dict, module_w: int, module_h: int) -> List[Tuple[
     return rects
 
 def build_rois_from_preset(preset) -> List[PortROI]:
-    """Unterstützt neues Mapping-Format; migriert ggf. sehr alte Struktur."""
     module_w = preset.get("module", {}).get("w", 128)
     module_h = preset.get("module", {}).get("h", 256)
     ports = preset.get("ports", [])
@@ -166,7 +150,7 @@ def build_rois_from_preset(preset) -> List[PortROI]:
         if "start" in port or "mode" in port:
             rects = _gen_rects_new_port(port, module_w, module_h)
         else:
-            # extreme Altlast – einfache Migration
+            # sehr alte Struktur – Migration
             x = int(port.get("x", 0))
             rects_tmp = []
             for blk in port.get("blocks", []):
@@ -228,7 +212,6 @@ class MasterStrip:
         p.drawText(0, baseline, self.text)
         p.end()
 
-        # **NEU**: 180°-Drehung optional (Mirror X & Y)
         if self.rotate180:
             self.single_h = self.single_h.mirrored(True, True)
 
@@ -238,21 +221,19 @@ class MasterStrip:
         p2.drawImage(self.text_w,0,self.single_h)
         p2.end()
 
-        # Vertikal Basetext (sichtbar durch translate + rotate)
+        # Vertikal Basetext
         self.single_v = QImage(self.module_w, self.text_w, QImage.Format_RGB888)
         self.single_v.fill(QColor(*self.bg_rgb))
         p3 = QPainter(self.single_v)
         p3.setRenderHint(QPainter.TextAntialiasing, True)
         p3.setPen(QColor(*self.text_rgb))
         p3.setFont(self.font)
-        # Ursprung verschieben und dann drehen, damit Text in der Fläche landet
         p3.translate(0, self.text_w)
         p3.rotate(-90)
-        baseline_v = (self.module_w + QFontMetrics(self.font).ascent() - QFontMetrics(self.font).descent()) // 2
+        baseline_v = (self.module_w + fm.ascent() - fm.descent()) // 2
         p3.drawText(0, baseline_v, self.text)
         p3.end()
 
-        # **NEU**: 180°-Drehung optional
         if self.rotate180:
             self.single_v = self.single_v.mirrored(True, True)
 
@@ -394,20 +375,21 @@ class Main(QMainWindow):
         self.cfg.height = int(out.get("height", self.cfg.height))
         self.cfg.fps    = int(out.get("fps",    self.cfg.fps))
         self.cfg.speed_px_per_frame = float(out.get("speed_px_per_frame", self.cfg.speed_px_per_frame))
-        self.cfg.rotate180 = bool(out.get("rotate180", self.cfg.rotate180))  # **NEU**
+        self.cfg.rotate180 = bool(out.get("rotate180", self.cfg.rotate180))
+        self.cfg.direction = str(out.get("direction", self.cfg.direction))  # **NEU**
 
         # Scheduler
         self.scheduler = Scheduler(self.contents, self.preset.get("scheduler", {}).get("entries", []))
         self.current_content_name = self.scheduler.pick_content_name() or self.preset["contents"][0]["name"]
 
-        # Live-Quelle (neu): "scheduler" | "manual"
+        # Live-Quelle
         self.live_source = "scheduler"
         self.live_content_name: Optional[str] = None
 
         # Crossfade
         self.next_content_name: Optional[str] = None
         self.crossfade_active = False
-        self.crossfade_start: Optional[datetime.datetime] = None
+               self.crossfade_start: Optional[datetime.datetime] = None
         self.crossfade_ms = 800
 
         # Strips
@@ -499,7 +481,7 @@ class Main(QMainWindow):
         ctl.addWidget(QLabel("H"));  ctl.addWidget(self.out_h)
         ctl.addWidget(QLabel("FPS")); ctl.addWidget(self.fps_box)
 
-        # **Neu: Live-Content-Auswahl**
+        # Live-Content-Auswahl
         self.live_content_cb = QComboBox()
         ctl.addWidget(QLabel("Live-Content"))
         ctl.addWidget(self.live_content_cb)
@@ -514,10 +496,16 @@ class Main(QMainWindow):
         self.overlay_chk = QCheckBox("ROI-Overlay")
         self.overlay_chk.setChecked(True)
 
-        # **NEU: 180°-Rotation**
+        # 180°-Rotation
         self.rotate_chk = QCheckBox("Text 180° drehen")
         self.rotate_chk.setChecked(self.cfg.rotate180)
         self.rotate_chk.stateChanged.connect(self.on_rotate_changed)
+
+        # **NEU: Laufrichtung**
+        self.dir_cb = QComboBox()
+        self.dir_cb.addItems(["Vorwärts", "Rückwärts"])
+        self.dir_cb.setCurrentIndex(0 if self.cfg.direction == "forward" else 1)
+        self.dir_cb.currentIndexChanged.connect(self.on_direction_changed)
 
         self.live_btn = QPushButton("Live")
         self.stop_btn = QPushButton("Stop")
@@ -526,7 +514,9 @@ class Main(QMainWindow):
         ctl.addWidget(QLabel("Geschwindigkeit (px/Frame)"))
         ctl.addWidget(self.speed)
         ctl.addWidget(self.overlay_chk)
-        ctl.addWidget(self.rotate_chk)   # **NEU in GUI**
+        ctl.addWidget(self.rotate_chk)
+        ctl.addWidget(QLabel("Laufrichtung"))
+        ctl.addWidget(self.dir_cb)  # **NEU in GUI**
         ctl.addWidget(self.live_btn)
         ctl.addWidget(self.stop_btn)
         ctl.addWidget(self.full_btn)
@@ -660,9 +650,9 @@ class Main(QMainWindow):
         self.out_h.valueChanged.connect(self.on_out_res_changed)
         self.fps_box.valueChanged.connect(self.on_fps_changed)
 
-        # **Neu: Live-Content-Änderung**
+        # Live-Content + neue Optionen
         self.live_content_cb.currentTextChanged.connect(self.on_live_content_changed)
-        self.refresh_live_content_cb()  # Dropdown initial befüllen
+        self.refresh_live_content_cb()
 
         if self.contents_list.count() > 0:
             self.contents_list.setCurrentRow(0)
@@ -691,7 +681,12 @@ class Main(QMainWindow):
         self.current_preset_path = None
         return {
             "name": "Default_FHD50",
-            "output": {"width": 1920, "height": 1080, "fps": 50, "speed_px_per_frame": 1.0, "rotate180": False},
+            "output": {
+                "width": 1920, "height": 1080, "fps": 50,
+                "speed_px_per_frame": 1.0,
+                "rotate180": False,
+                "direction": "forward"              # **NEU**
+            },
             "module": {"w": 128, "h": 256},
             "ports": [
                 {"id":"port1","start":{"x":0,"y":824},"mode":"vertical","path_mode":"snake",
@@ -761,7 +756,6 @@ class Main(QMainWindow):
         name = cur.text()
         self.contents.pop(name, None)
         self.contents_list.takeItem(self.contents_list.currentRow())
-        # Live-Auswahl korrigieren, falls gelöscht
         if self.live_source == "manual" and self.live_content_name == name:
             self.live_source = "scheduler"
             self.live_content_name = None
@@ -777,7 +771,7 @@ class Main(QMainWindow):
         return MasterStrip(c.text, c.font_family, int(c.font_pt), c.text_rgb, c.bg_rgb,
                            self.module_w, self.module_h, self.num_modules, rotate180=self.cfg.rotate180)
 
-    # **Neu:** Live-Content Dropdown befüllen/aktualisieren
+    # Live-Content Dropdown
     def refresh_live_content_cb(self):
         current = self.live_content_cb.currentText() if self.live_content_cb.count() else None
         self.live_content_cb.blockSignals(True)
@@ -785,14 +779,12 @@ class Main(QMainWindow):
         self.live_content_cb.addItem("Scheduler (auto)")
         for name in self.contents.keys():
             self.live_content_cb.addItem(name)
-        # Wiederherstellen
         if self.live_source == "manual" and self.live_content_name in self.contents:
             self.live_content_cb.setCurrentText(self.live_content_name)
         else:
             self.live_content_cb.setCurrentIndex(0)
         self.live_content_cb.blockSignals(False)
 
-    # **Neu:** Reaktion auf Auswahlwechsel im Live-Content
     def on_live_content_changed(self, text: str):
         if text.startswith("Scheduler"):
             self.live_source = "scheduler"
@@ -804,7 +796,6 @@ class Main(QMainWindow):
                 self.crossfade_active = False; self.crossfade_start = None; self.strip_next = None
             return
 
-        # manueller Inhalt
         self.live_source = "manual"
         self.live_content_name = text
         if self.live_content_name != self.current_content_name:
@@ -812,7 +803,6 @@ class Main(QMainWindow):
             self.strip_curr = self.make_strip(self.current_content_name)
             self.crossfade_active = False; self.crossfade_start = None; self.strip_next = None
         else:
-            # ggf. Fonts/Farben aktualisieren, falls geändert
             self.strip_curr = self.make_strip(self.current_content_name)
 
     # -------- Scheduler Table --------
@@ -897,7 +887,6 @@ class Main(QMainWindow):
         self.p_start_y.setValue(int(sy))
         self.p_mode.setCurrentText(p.get("mode","vertical"))
         self.p_path_mode.setCurrentText(p.get("path_mode","snake"))
-        # Blocks
         blks = p.get("blocks", [])
         self.blocks_tbl.setRowCount(0)
         for b in blks:
@@ -989,7 +978,6 @@ class Main(QMainWindow):
     def on_out_res_changed(self):
         self.cfg.width = int(self.out_w.value())
         self.cfg.height = int(self.out_h.value())
-        # Recreate frame buffer to match resolution
         self.frame_buffer = QImage(self.cfg.width, self.cfg.height, QImage.Format_RGB888)
         self.frame_buffer.fill(Qt.black)
 
@@ -999,20 +987,22 @@ class Main(QMainWindow):
             self.timer.start(int(1000 / max(1, self.cfg.fps)))
         self.preset.setdefault("output", {})["fps"] = self.cfg.fps
 
-    # NEU: Speed-Änderungen fortschreiben
     def on_speed_changed(self):
         self.cfg.speed_px_per_frame = float(self.speed.value())
         self.preset.setdefault("output", {})["speed_px_per_frame"] = self.cfg.speed_px_per_frame
 
-    # **NEU: Rotation-Änderung**
     def on_rotate_changed(self, _state):
         self.cfg.rotate180 = self.rotate_chk.isChecked()
         self.preset.setdefault("output", {})["rotate180"] = self.cfg.rotate180
-        # Strips neu bauen, damit Rotation sofort greift
         if self.current_content_name:
             self.strip_curr = self.make_strip(self.current_content_name)
         if self.strip_next and self.next_content_name:
             self.strip_next = self.make_strip(self.next_content_name)
+
+    # **NEU: Laufrichtung geändert**
+    def on_direction_changed(self, idx: int):
+        self.cfg.direction = "forward" if idx == 0 else "reverse"
+        self.preset.setdefault("output", {})["direction"] = self.cfg.direction
 
     # -------- Render mapping --------
     @staticmethod
@@ -1042,7 +1032,6 @@ class Main(QMainWindow):
             y = 0
 
     def render_mapped_frame(self, strip: Optional[MasterStrip], offset_px: float) -> QImage:
-        # reuse offscreen buffer
         frame = self.frame_buffer
         bg = (0,0,0)
         if self.current_content_name in self.contents:
@@ -1072,12 +1061,10 @@ class Main(QMainWindow):
     def draw_fps_overlay(self, img: QImage, fps: float):
         p = QPainter(img)
         p.setRenderHint(QPainter.TextAntialiasing, False)
-        # small semi-transparent box
         rect_w, rect_h = 110, 36
         margin = 8
         x = img.width() - rect_w - margin
         y = margin
-        # background
         p.fillRect(QRect(x, y, rect_w, rect_h), QColor(0,0,0,160))
         p.setPen(QColor(255,255,255))
         p.setFont(QFont("Arial", 12))
@@ -1130,7 +1117,6 @@ class Main(QMainWindow):
                     return e.get("content"), e
         for e in self.scheduler.entries:
             if e.get("type") == "daily" and now.weekday() in (e.get("weekdays") or []):
-            #    if in_range(now.time(), parse_time(e["start"]), parse_time(e["end"])):
                 if in_range(now.time(), parse_time(e["start"]), parse_time(e["end"])):
                     return e.get("content"), e
         return None, None
@@ -1146,7 +1132,6 @@ class Main(QMainWindow):
                 self.crossfade_active = False
                 self.crossfade_start = None
         else:
-            # Scheduler-Modus
             target_name, entry = self.choose_target_content()
             fallback = next(iter(self.contents.keys()), None)
             desired = target_name or fallback or self.current_content_name
@@ -1162,9 +1147,10 @@ class Main(QMainWindow):
                     self.crossfade_active = True
                     self.crossfade_start = datetime.datetime.now()
 
-        # Bewegung
+        # Bewegung: **Richtung berücksichtigen**
+        sign = 1.0 if self.cfg.direction == "forward" else -1.0
         self.cfg.speed_px_per_frame = float(self.speed.value())
-        self.offset += self.cfg.speed_px_per_frame
+        self.offset += sign * self.cfg.speed_px_per_frame
 
         base_curr = self.render_mapped_frame(self.strip_curr, self.offset)
         frame = base_curr
@@ -1180,7 +1166,7 @@ class Main(QMainWindow):
                 self.crossfade_active = False
                 self.crossfade_start = None
 
-        # --- FPS tracking ---
+        # FPS tracking
         now_ms = datetime.datetime.now().timestamp() * 1000.0
         self._fps_times.append(now_ms)
         if len(self._fps_times) >= 6:
@@ -1188,9 +1174,8 @@ class Main(QMainWindow):
             if span > 0:
                 self._fps_value = 1000.0 * (len(self._fps_times)-1) / span
 
-        # Draw FPS overlay onto the display frame (non-invasive to export pipeline)
+        # Overlay
         self.draw_fps_overlay(frame, self._fps_value)
-
         vis = draw_roi_overlay(frame, self.rois_ports) if self.overlay_chk.isChecked() else frame
         self.preview.set_frame(vis)
         if hasattr(self, "out_win") and self.out_win and self.out_win.isVisible():
@@ -1224,7 +1209,8 @@ class Main(QMainWindow):
                 "height": int(self.out_h.value()),
                 "fps": int(self.fps_box.value()),
                 "speed_px_per_frame": float(self.speed.value()),
-                "rotate180": bool(self.rotate_chk.isChecked())  # **NEU: im Preset speichern**
+                "rotate180": bool(self.rotate_chk.isChecked()),
+                "direction": "forward" if self.dir_cb.currentIndex() == 0 else "reverse"  # **NEU**
             },
             "module": {"w": int(self.mod_w.value()), "h": int(self.mod_h.value())},
             "ports": self.preset.get("ports", []),
@@ -1251,7 +1237,6 @@ class Main(QMainWindow):
             QMessageBox.critical(self, "Fehler", f"Konnte Preset nicht speichern: {e}")
 
     def update_preset(self):
-        """Speichern-Button: Änderungen in DIE aktuell geladene Preset-Datei schreiben."""
         data = self.snapshot_preset_from_state()
         if not self.current_preset_path:
             return self.save_preset_as()
@@ -1298,15 +1283,17 @@ class Main(QMainWindow):
         self.cfg.height = int(out.get("height", self.cfg.height))
         self.cfg.fps    = int(out.get("fps",    self.cfg.fps))
         self.cfg.speed_px_per_frame = float(out.get("speed_px_per_frame", self.cfg.speed_px_per_frame))
-        self.cfg.rotate180 = bool(out.get("rotate180", self.cfg.rotate180))  # **NEU**
+        self.cfg.rotate180 = bool(out.get("rotate180", self.cfg.rotate180))
+        self.cfg.direction = str(out.get("direction", self.cfg.direction))
 
         self.out_w.setValue(self.cfg.width)
         self.out_h.setValue(self.cfg.height)
         self.fps_box.setValue(self.cfg.fps)
         self.speed.setValue(self.cfg.speed_px_per_frame)
-        self.rotate_chk.setChecked(self.cfg.rotate180)  # **NEU**
+        self.rotate_chk.setChecked(self.cfg.rotate180)
+        self.dir_cb.setCurrentIndex(0 if self.cfg.direction == "forward" else 1)
 
-        # Live-Content-Liste aktualisieren (Dropdown)
+        # Live-Content-Liste aktualisieren
         self.refresh_live_content_cb()
 
         self.current_content_name = self.scheduler.pick_content_name() or p["contents"][0]["name"]
@@ -1315,10 +1302,8 @@ class Main(QMainWindow):
         self.crossfade_active = False
         self.crossfade_start = None
         self.offset = 0.0
-        # Offscreen frame buffer reused each frame
         self.frame_buffer = QImage(self.cfg.width, self.cfg.height, QImage.Format_RGB888)
         self.frame_buffer.fill(Qt.black)
-        # FPS tracking
         self._fps_times = deque(maxlen=180)
         self._fps_value = 0.0
 
@@ -1327,7 +1312,6 @@ class Main(QMainWindow):
         if not name:
             return
         cur_item = self.contents_list.currentItem()
-        # Rename-Logik
         if cur_item and name != cur_item.text():
             if name in self.contents:
                 QMessageBox.warning(self, "Hinweis", "Name existiert bereits.")
@@ -1337,25 +1321,18 @@ class Main(QMainWindow):
             c.name = name
             self.contents[name] = c
             cur_item.setText(name)
-            # **Neu:** Live-/Current-Namen fortschreiben
             if self.current_content_name == old_name:
                 self.current_content_name = name
             if self.live_source == "manual" and self.live_content_name == old_name:
                 self.live_content_name = name
-        # Sicherstellen, dass Eintrag existiert
         if name not in self.contents:
             self.contents[name] = ContentItem(name, "", "Arial", 72, (255,255,255), (0,0,0))
         c = self.contents[name]
-        # Änderungen übernehmen
         c.text = self.c_text.text()
         c.font_family = self.c_font.currentFont().family()
         c.font_pt = int(self.c_size.value())
-
-        # **Neu:** Falls der aktuell sichtbare Content geändert wurde → Strip neu bauen (Fonts/Farben sofort live)
         if self.current_content_name == name:
             self.strip_curr = self.make_strip(self.current_content_name)
-
-        # Dropdown aktualisieren
         self.refresh_live_content_cb()
 
     # -------- Export --------
@@ -1388,6 +1365,9 @@ class Main(QMainWindow):
         exp_w = max(1, min(exp_w, full_w - exp_x))
         exp_h = max(1, min(exp_h, full_h - exp_y))
 
+        # **Richtung berücksichtigen**
+        signed_step = int_speed if self.cfg.direction == "forward" else -int_speed
+
         cmd = [
             ffmpeg, "-y",
             "-f", "rawvideo",
@@ -1406,21 +1386,20 @@ class Main(QMainWindow):
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
             local = 0.0
             for _ in range(period):
-                frame = self.render_mapped_frame(self.strip_curr, self.offset + local)  # volle Stage
-                # Crop anwenden
+                frame = self.render_mapped_frame(self.strip_curr, self.offset + local)
                 crop_rect = QRect(exp_x, exp_y, exp_w, exp_h)
                 crop_frame = frame.copy(crop_rect)
-                # in Pipe schreiben
                 ptr = crop_frame.bits()
                 ptr.setsize(crop_frame.sizeInBytes())
                 proc.stdin.write(bytes(ptr))
-                local += int_speed
+                local += signed_step
             proc.stdin.close()
             proc.wait()
             QMessageBox.information(
                 self, "Fertig",
                 f"Export abgeschlossen. Frames {period}, Größe {exp_w}x{exp_h}@{self.cfg.fps}.\n"
-                f"Crop: {'aktiv' if self.crop_enable.isChecked() else 'aus'} ({exp_x},{exp_y},{exp_w},{exp_h})"
+                f"Crop: {'aktiv' if self.crop_enable.isChecked() else 'aus'} ({exp_x},{exp_y},{exp_w},{exp_h})\n"
+                f"Richtung: {'Vorwärts' if self.cfg.direction=='forward' else 'Rückwärts'}"
             )
         except Exception as e:
             QMessageBox.critical(self, "Exportfehler", str(e))
