@@ -1,12 +1,13 @@
 # main.py — Studio Rayy Ticker (Mapping-Editor, vertikale/horizontale Laufrichtung,
 # Fullscreen-Fix, Pfadmodus-Umbenennung, Block-Dropdowns, freie Ausgabeauflösung,
-# Export-Zuschnitt/Crop, FFmpeg-Export, **Live-Content-Auswahl**)
+# Export-Zuschnitt/Crop, FFmpeg-Export, **Live-Content-Auswahl**, **180°-Rotation**)
 #
 # Tabs:
 # - Contents: mehrere Texte/Styles definieren (Font, Größe, Farben)
 # - Scheduler: zeitgesteuerter Wechsel (daily/date, Transition, Fade)
 # - Output: Live/Stop/Fullscreen, ROI-Overlay, Geschwindigkeit, Ausgabe-W/H/FPS,
 #           **Live-Content-Dropdown (Scheduler oder manuell)**,
+#           **Text 180° drehen (Checkbox)**,
 #           sowie Export MP4 inkl. frei wählbarem Crop (X,Y,W,H)
 # - Preset: laden/speichern/aktualisieren
 # - Mapping: Ports/Module/Blöcke konfigurieren (Mode, Pfadmodus "snake/reset",
@@ -20,6 +21,7 @@
 # - Export unterstützt frei einstellbaren Zuschnitt (Crop) und dynamische Ausgabegröße/FPS.
 # - **Neu:** Live-Output kann explizit einen Content wählen (Dropdown). Fonts/Farben/Größe
 #   werden sofort übernommen, sobald Änderungen übernommen oder Content gewechselt wird.
+# - **Neu:** Option „Text 180° drehen“ (GUI-Checkbox), live wirksam und im Preset speicher-/ladbar.
 
 import sys, os, shutil, subprocess, json, datetime
 from math import gcd
@@ -65,6 +67,7 @@ class CFG:
     height: int = 1080
     fps: int = 50
     speed_px_per_frame: float = 4.0  # "Geschwindigkeit"
+    rotate180: bool = False          # **NEU**: 180°-Drehung
 
 # ----------------------------- Mapping Structures -----------------------------
 class PortROI:
@@ -198,7 +201,7 @@ class MasterStrip:
        Vertikal:   single_v (w=module_w, h=text_w) – Text um -90° rotiert; double_v (2x in y)
     """
     def __init__(self, text: str, font_family: str, font_pt: int, text_rgb: Tuple[int,int,int], bg_rgb: Tuple[int,int,int],
-                 module_w: int, module_h: int, num_modules: int):
+                 module_w: int, module_h: int, num_modules: int, rotate180: bool = False):
         self.text = text if text else " "
         self.font = QFont(font_family, font_pt)
         self.text_rgb = text_rgb
@@ -206,6 +209,7 @@ class MasterStrip:
         self.module_w = module_w
         self.module_h = module_h
         self.num_modules = num_modules
+        self.rotate180 = rotate180
         self.rebuild()
 
     def rebuild(self):
@@ -223,6 +227,11 @@ class MasterStrip:
         baseline = (h + fm.ascent() - fm.descent()) // 2
         p.drawText(0, baseline, self.text)
         p.end()
+
+        # **NEU**: 180°-Drehung optional (Mirror X & Y)
+        if self.rotate180:
+            self.single_h = self.single_h.mirrored(True, True)
+
         self.double_h = QImage(self.text_w*2, h, QImage.Format_RGB888)
         p2 = QPainter(self.double_h)
         p2.drawImage(0,0,self.single_h)
@@ -236,12 +245,17 @@ class MasterStrip:
         p3.setRenderHint(QPainter.TextAntialiasing, True)
         p3.setPen(QColor(*self.text_rgb))
         p3.setFont(self.font)
-        # Wichtig: Ursprung verschieben und dann drehen, damit Text in der Fläche landet
+        # Ursprung verschieben und dann drehen, damit Text in der Fläche landet
         p3.translate(0, self.text_w)
         p3.rotate(-90)
-        baseline_v = (self.module_w + fm.ascent() - fm.descent()) // 2
+        baseline_v = (self.module_w + QFontMetrics(self.font).ascent() - QFontMetrics(self.font).descent()) // 2
         p3.drawText(0, baseline_v, self.text)
         p3.end()
+
+        # **NEU**: 180°-Drehung optional
+        if self.rotate180:
+            self.single_v = self.single_v.mirrored(True, True)
+
         self.double_v = QImage(self.module_w, self.text_w*2, QImage.Format_RGB888)
         p4 = QPainter(self.double_v)
         p4.drawImage(0,0,self.single_v)
@@ -254,7 +268,6 @@ class MasterStrip:
     # Horizontal Sampling (links->rechts)
     def tile_src_rect_h(self, offset_px: float, module_index: int, reverse=False) -> QRect:
         if reverse:
-            # reverse: sowohl Offset als auch modulare Verschiebung negativ
             x = int((-offset_px - module_index * self.module_w)) % self.text_w
         else:
             x = int(( offset_px + module_index * self.module_w)) % self.text_w
@@ -268,6 +281,7 @@ class MasterStrip:
         else:
             y = int(( offset_px + module_index * self.module_h)) % period
         return QRect(0, y, self.module_w, self.module_h)
+
 # ----------------------------- Scheduler -----------------------------
 def parse_time(s: str) -> datetime.time:
     return datetime.time.fromisoformat(s)
@@ -380,6 +394,7 @@ class Main(QMainWindow):
         self.cfg.height = int(out.get("height", self.cfg.height))
         self.cfg.fps    = int(out.get("fps",    self.cfg.fps))
         self.cfg.speed_px_per_frame = float(out.get("speed_px_per_frame", self.cfg.speed_px_per_frame))
+        self.cfg.rotate180 = bool(out.get("rotate180", self.cfg.rotate180))  # **NEU**
 
         # Scheduler
         self.scheduler = Scheduler(self.contents, self.preset.get("scheduler", {}).get("entries", []))
@@ -498,6 +513,12 @@ class Main(QMainWindow):
         self.speed.valueChanged.connect(self.on_speed_changed)
         self.overlay_chk = QCheckBox("ROI-Overlay")
         self.overlay_chk.setChecked(True)
+
+        # **NEU: 180°-Rotation**
+        self.rotate_chk = QCheckBox("Text 180° drehen")
+        self.rotate_chk.setChecked(self.cfg.rotate180)
+        self.rotate_chk.stateChanged.connect(self.on_rotate_changed)
+
         self.live_btn = QPushButton("Live")
         self.stop_btn = QPushButton("Stop")
         self.full_btn = QPushButton("Fullscreen An/Aus")
@@ -505,6 +526,7 @@ class Main(QMainWindow):
         ctl.addWidget(QLabel("Geschwindigkeit (px/Frame)"))
         ctl.addWidget(self.speed)
         ctl.addWidget(self.overlay_chk)
+        ctl.addWidget(self.rotate_chk)   # **NEU in GUI**
         ctl.addWidget(self.live_btn)
         ctl.addWidget(self.stop_btn)
         ctl.addWidget(self.full_btn)
@@ -669,7 +691,7 @@ class Main(QMainWindow):
         self.current_preset_path = None
         return {
             "name": "Default_FHD50",
-            "output": {"width": 1920, "height": 1080, "fps": 50, "speed_px_per_frame": 1.0},
+            "output": {"width": 1920, "height": 1080, "fps": 50, "speed_px_per_frame": 1.0, "rotate180": False},
             "module": {"w": 128, "h": 256},
             "ports": [
                 {"id":"port1","start":{"x":0,"y":824},"mode":"vertical","path_mode":"snake",
@@ -753,7 +775,7 @@ class Main(QMainWindow):
             return None
         c = self.contents[name]
         return MasterStrip(c.text, c.font_family, int(c.font_pt), c.text_rgb, c.bg_rgb,
-                           self.module_w, self.module_h, self.num_modules)
+                           self.module_w, self.module_h, self.num_modules, rotate180=self.cfg.rotate180)
 
     # **Neu:** Live-Content Dropdown befüllen/aktualisieren
     def refresh_live_content_cb(self):
@@ -775,7 +797,6 @@ class Main(QMainWindow):
         if text.startswith("Scheduler"):
             self.live_source = "scheduler"
             self.live_content_name = None
-            # Optional: sofort auf Scheduler-Inhalt wechseln (Cut)
             target = self.scheduler.pick_content_name() or next(iter(self.contents.keys()), None)
             if target and target != self.current_content_name:
                 self.current_content_name = target
@@ -977,11 +998,22 @@ class Main(QMainWindow):
         if self.timer.isActive():
             self.timer.start(int(1000 / max(1, self.cfg.fps)))
         self.preset.setdefault("output", {})["fps"] = self.cfg.fps
+
     # NEU: Speed-Änderungen fortschreiben
     def on_speed_changed(self):
         self.cfg.speed_px_per_frame = float(self.speed.value())
         self.preset.setdefault("output", {})["speed_px_per_frame"] = self.cfg.speed_px_per_frame
-        
+
+    # **NEU: Rotation-Änderung**
+    def on_rotate_changed(self, _state):
+        self.cfg.rotate180 = self.rotate_chk.isChecked()
+        self.preset.setdefault("output", {})["rotate180"] = self.cfg.rotate180
+        # Strips neu bauen, damit Rotation sofort greift
+        if self.current_content_name:
+            self.strip_curr = self.make_strip(self.current_content_name)
+        if self.strip_next and self.next_content_name:
+            self.strip_next = self.make_strip(self.next_content_name)
+
     # -------- Render mapping --------
     @staticmethod
     def _draw_wrapped_h(p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_x: int):
@@ -995,7 +1027,7 @@ class Main(QMainWindow):
             remaining -= take
             dx += take
             x = 0
-    
+
     @staticmethod
     def _draw_wrapped_v(p: QPainter, src_img: QImage, dst_x: int, dst_y: int, dst_w: int, dst_h: int, start_y: int):
         H = src_img.height()  # erwartet strip.double_v => 2*text_w
@@ -1008,7 +1040,7 @@ class Main(QMainWindow):
             remaining -= take
             dy += take
             y = 0
-    
+
     def render_mapped_frame(self, strip: Optional[MasterStrip], offset_px: float) -> QImage:
         # reuse offscreen buffer
         frame = self.frame_buffer
@@ -1018,19 +1050,19 @@ class Main(QMainWindow):
         frame.fill(QColor(*bg))
         if strip is None:
             return frame
-    
+
         p = QPainter(frame)
         for idx, (dx,dy,dw,dh,dirv) in enumerate(self.dest_sequence):
             if dirv in ("left_right","right_left"):
                 reverse = (dirv == "right_left")
                 start_x = strip.tile_src_rect_h(offset_px, idx, reverse=reverse).x()
                 self._draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
-    
+
             elif dirv in ("top_down","bottom_up"):
                 reverse = (dirv == "bottom_up")
                 start_y = strip.tile_src_rect_v(offset_px, idx, reverse=reverse).y()
                 self._draw_wrapped_v(p, strip.double_v, dx, dy, dw, dh, start_y)
-    
+
             else:
                 start_x = strip.tile_src_rect_h(offset_px, idx, reverse=False).x()
                 self._draw_wrapped_h(p, strip.double_h, dx, dy, dw, dh, start_x)
@@ -1098,6 +1130,7 @@ class Main(QMainWindow):
                     return e.get("content"), e
         for e in self.scheduler.entries:
             if e.get("type") == "daily" and now.weekday() in (e.get("weekdays") or []):
+            #    if in_range(now.time(), parse_time(e["start"]), parse_time(e["end"])):
                 if in_range(now.time(), parse_time(e["start"]), parse_time(e["end"])):
                     return e.get("content"), e
         return None, None
@@ -1190,7 +1223,8 @@ class Main(QMainWindow):
                 "width": int(self.out_w.value()),
                 "height": int(self.out_h.value()),
                 "fps": int(self.fps_box.value()),
-                "speed_px_per_frame": float(self.speed.value())
+                "speed_px_per_frame": float(self.speed.value()),
+                "rotate180": bool(self.rotate_chk.isChecked())  # **NEU: im Preset speichern**
             },
             "module": {"w": int(self.mod_w.value()), "h": int(self.mod_h.value())},
             "ports": self.preset.get("ports", []),
@@ -1263,11 +1297,15 @@ class Main(QMainWindow):
         self.cfg.width  = int(out.get("width",  self.cfg.width))
         self.cfg.height = int(out.get("height", self.cfg.height))
         self.cfg.fps    = int(out.get("fps",    self.cfg.fps))
+        self.cfg.speed_px_per_frame = float(out.get("speed_px_per_frame", self.cfg.speed_px_per_frame))
+        self.cfg.rotate180 = bool(out.get("rotate180", self.cfg.rotate180))  # **NEU**
+
         self.out_w.setValue(self.cfg.width)
         self.out_h.setValue(self.cfg.height)
         self.fps_box.setValue(self.cfg.fps)
         self.speed.setValue(self.cfg.speed_px_per_frame)
-        
+        self.rotate_chk.setChecked(self.cfg.rotate180)  # **NEU**
+
         # Live-Content-Liste aktualisieren (Dropdown)
         self.refresh_live_content_cb()
 
@@ -1283,7 +1321,6 @@ class Main(QMainWindow):
         # FPS tracking
         self._fps_times = deque(maxlen=180)
         self._fps_value = 0.0
-
 
     def commit_current_content_edits(self):
         name = self.c_name.text().strip()
