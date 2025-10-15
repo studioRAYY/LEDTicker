@@ -342,7 +342,6 @@ class Main(QMainWindow):
         # FPS tracking
         self._fps_times = deque(maxlen=180)
         self._fps_value = 0.0
-        # Skip preview repaints while fullscreen is active to avoid double composition
         self.preview_mirror_suspend = False
 
 
@@ -394,7 +393,7 @@ class Main(QMainWindow):
         # Crossfade
         self.next_content_name: Optional[str] = None
         self.crossfade_active = False
-        self.crossfade_start: Optional[datetime.datetime] = None
+               self.crossfade_start: Optional[datetime.datetime] = None
         self.crossfade_ms = 800
 
         # Strips
