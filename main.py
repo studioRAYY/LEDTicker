@@ -389,7 +389,7 @@ class Main(QMainWindow):
         # Crossfade
         self.next_content_name: Optional[str] = None
         self.crossfade_active = False
-               self.crossfade_start: Optional[datetime.datetime] = None
+        self.crossfade_start: Optional[datetime.datetime] = None
         self.crossfade_ms = 800
 
         # Strips
