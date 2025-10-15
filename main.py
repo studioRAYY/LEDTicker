@@ -317,13 +317,15 @@ class OutputWindow(QWidget):
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.frame = QImage(w,h,QImage.Format_RGB888)
         self.frame.fill(Qt.black)
+        self._pixmap = QPixmap.fromImage(self.frame)
     def set_frame(self, img: QImage):
         self.frame = img
+        self._pixmap = QPixmap.fromImage(img)
     def paintEvent(self, _):
         p = QPainter(self)
         r = self.rect()
         p.fillRect(r, Qt.black)
-        scaled = self.frame.scaled(r.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
+        scaled = self._pixmap.scaled(r.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
         p.drawImage((r.width()-scaled.width())//2,(r.height()-scaled.height())//2, scaled)
         p.end()
 
@@ -340,6 +342,9 @@ class Main(QMainWindow):
         # FPS tracking
         self._fps_times = deque(maxlen=180)
         self._fps_value = 0.0
+        # Skip preview repaints while fullscreen is active to avoid double composition
+        self.preview_mirror_suspend = False
+
 
         self.current_preset_path: Optional[str] = None
 
@@ -389,7 +394,7 @@ class Main(QMainWindow):
         # Crossfade
         self.next_content_name: Optional[str] = None
         self.crossfade_active = False
-        self.crossfade_start: Optional[datetime.datetime] = None
+               self.crossfade_start: Optional[datetime.datetime] = None
         self.crossfade_ms = 800
 
         # Strips
@@ -1079,108 +1084,24 @@ class Main(QMainWindow):
     def stop_live(self):
         self.timer.stop()
 
-    def fullscreen_toggle(self):
-        screens = QGuiApplication.screens()
-        if not hasattr(self, "out_win") or self.out_win is None:
-            self.out_win = OutputWindow(self.cfg.width, self.cfg.height)
-        if self.out_win.isVisible():
-            ret = QMessageBox.question(
-                self, "Fullscreen beenden?", "Fullscreen wirklich ausschalten?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-            )
-            if ret == QMessageBox.Yes:
-                self.out_win.close()
-                self.out_win = None
-        else:
-            if len(screens) < 2:
-                QMessageBox.information(self, "Info", "Kein zweiter Bildschirm erkannt.")
-                return
-            g = screens[1].geometry()
-            self.out_win.setGeometry(g)
-            self.out_win.showFullScreen()
-
-    def composite_crossfade(self, a: QImage, b: QImage, alpha: float) -> QImage:
-        out = QImage(a.size(), QImage.Format_RGB888)
-        p = QPainter(out)
-        p.drawImage(0,0,a)
-        p.setOpacity(alpha)
-        p.drawImage(0,0,b)
-        p.setOpacity(1.0)
-        p.end()
-        return out
-
-    def choose_target_content(self) -> Tuple[Optional[str], Optional[dict]]:
-        now = datetime.datetime.now()
-        for e in self.scheduler.entries:
-            if e.get("type") == "date" and e.get("date") == now.date().isoformat():
-                if in_range(now.time(), parse_time(e["start"]), parse_time(e["end"])):
-                    return e.get("content"), e
-        for e in self.scheduler.entries:
-            if e.get("type") == "daily" and now.weekday() in (e.get("weekdays") or []):
-                if in_range(now.time(), parse_time(e["start"]), parse_time(e["end"])):
-                    return e.get("content"), e
-        return None, None
-
-    def tick(self):
-        # Quelle bestimmen
-        if self.live_source == "manual":
-            desired = self.live_content_name or next(iter(self.contents.keys()), None) or self.current_content_name
-            if desired != self.current_content_name:
-                self.current_content_name = desired
-                self.strip_curr = self.make_strip(self.current_content_name)
-                self.strip_next = None
-                self.crossfade_active = False
-                self.crossfade_start = None
-        else:
-            target_name, entry = self.choose_target_content()
-            fallback = next(iter(self.contents.keys()), None)
-            desired = target_name or fallback or self.current_content_name
-            if desired != self.current_content_name and not self.crossfade_active:
-                trans = (entry or {}).get("transition","crossfade")
-                if trans == "cut":
-                    self.current_content_name = desired
-                    self.strip_curr = self.make_strip(self.current_content_name)
-                else:
-                    self.next_content_name = desired
-                    self.strip_next = self.make_strip(self.next_content_name)
-                    self.crossfade_ms = int((entry or {}).get("fade_ms", 800))
-                    self.crossfade_active = True
-                    self.crossfade_start = datetime.datetime.now()
-
-        # Bewegung: **Richtung berücksichtigen**
-        sign = 1.0 if self.cfg.direction == "forward" else -1.0
-        self.cfg.speed_px_per_frame = float(self.speed.value())
-        self.offset += sign * self.cfg.speed_px_per_frame
-
-        base_curr = self.render_mapped_frame(self.strip_curr, self.offset)
-        frame = base_curr
-        if self.live_source == "scheduler" and self.crossfade_active and self.strip_next is not None and self.crossfade_start is not None:
-            elapsed = (datetime.datetime.now() - self.crossfade_start).total_seconds()*1000.0
-            a = max(0.0, min(1.0, elapsed / max(1, self.crossfade_ms)))
-            base_next = self.render_mapped_frame(self.strip_next, self.offset)
-            frame = self.composite_crossfade(base_curr, base_next, a)
-            if elapsed >= self.crossfade_ms:
-                self.current_content_name = self.next_content_name
-                self.strip_curr = self.strip_next
-                self.strip_next = None
-                self.crossfade_active = False
-                self.crossfade_start = None
-
-        # FPS tracking
-        now_ms = datetime.datetime.now().timestamp() * 1000.0
-        self._fps_times.append(now_ms)
-        if len(self._fps_times) >= 6:
-            span = self._fps_times[-1] - self._fps_times[0]
-            if span > 0:
-                self._fps_value = 1000.0 * (len(self._fps_times)-1) / span
-
-        # Overlay
-        self.draw_fps_overlay(frame, self._fps_value)
-        vis = draw_roi_overlay(frame, self.rois_ports) if self.overlay_chk.isChecked() else frame
-        self.preview.set_frame(vis)
-        if hasattr(self, "out_win") and self.out_win and self.out_win.isVisible():
-            self.out_win.set_frame(frame)
-            self.out_win.update()
+    
+def fullscreen_toggle(self):
+    screens = QGuiApplication.screens()
+    if not hasattr(self, "out_win") or self.out_win is None:
+        self.out_win = OutputWindow(self.cfg.width, self.cfg.height)
+    if self.out_win.isVisible():
+        ret = QMessageBox.question(
+            self, "Fullscreen beenden?", "Fullscreen wirklich ausschalten?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if ret == QMessageBox.Yes:
+            self.preview_mirror_suspend = False
+            self.out_win.close()
+        return
+    target_screen = screens[1] if len(screens) > 1 else screens[0]
+    self.out_win.setScreen(target_screen)
+    self.out_win.showFullScreen()
+    self.preview_mirror_suspend = True
 
     # -------- Preset IO --------
     def load_preset(self):
